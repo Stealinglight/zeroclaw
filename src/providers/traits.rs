@@ -17,6 +17,7 @@ mod tests {
                 native_tool_calling: true,
                 vision: true,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -134,16 +135,19 @@ mod tests {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
         let caps2 = ProviderCapabilities {
             native_tool_calling: true,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
         let caps3 = ProviderCapabilities {
             native_tool_calling: false,
             vision: false,
             prompt_caching: false,
+            extended_thinking: false,
         };
 
         assert_eq!(caps1, caps2);
@@ -287,6 +291,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -302,6 +307,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -397,6 +403,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -419,6 +426,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -441,6 +449,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking: None,
         };
 
         let err = provider.chat(request, "model", 0.7).await.unwrap_err();
@@ -489,6 +498,7 @@ mod tests {
             ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking: None,
             },
             "model",
             0.0,

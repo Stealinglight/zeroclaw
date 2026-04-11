@@ -944,6 +944,7 @@ impl Provider for ReliableProvider {
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
+                        thinking: request.thinking,
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
@@ -1131,6 +1132,7 @@ impl Provider for ReliableProvider {
             let req = ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
+                thinking: request.thinking,
             };
             let stream = provider.stream_chat(req, &current_model, temperature, options);
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -2142,6 +2144,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
         let result = provider.chat(request, "test-model", 0.0).await.unwrap();
 
@@ -2178,6 +2181,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
         let result = provider.chat(request, "test-model", 0.0).await.unwrap();
 
@@ -2249,6 +2253,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
         let err = provider
             .chat(request, "test", 0.0)
@@ -2339,6 +2344,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
         let result = provider.chat(request, "claude-opus", 0.0).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("ok from sonnet"));
@@ -2387,6 +2393,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
         let result = provider.chat(request, "test", 0.0).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("from fallback"));
@@ -2706,6 +2713,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking: None,
             },
             "model",
             0.0,
@@ -2747,6 +2755,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking: None,
             },
             "model",
             0.0,

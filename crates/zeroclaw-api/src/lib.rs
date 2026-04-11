@@ -33,4 +33,8 @@ tokio::task_local! {
     /// Override for tool choice mode, set by the agent loop.
     /// Read by providers that support native tool calling.
     pub static TOOL_CHOICE_OVERRIDE: Option<String>;
+
+    /// Native extended thinking parameters, set by the outer orchestration
+    /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
+    pub static NATIVE_THINKING_OVERRIDE: Option<crate::provider::NativeThinkingParams>;
 }
