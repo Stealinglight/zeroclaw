@@ -29,6 +29,7 @@ const ITEMS: NavItem[] = [
   { to: "/chat", label: "Chat", prefix: "/chat" },
   { to: "/board", label: "Board", prefix: "/board" },
   { to: "/overview", label: "Overview", prefix: "/overview" },
+  { to: "/system", label: "System", prefix: "/system" },
 ];
 
 interface SectionNavProps {

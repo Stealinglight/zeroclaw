@@ -3,6 +3,7 @@ import { ControlUiBootstrapProvider } from "@/app/ControlUiBootstrapProvider";
 import { ChatPage } from "@/chat/ChatPage";
 import { BoardPage } from "@/board/BoardPage";
 import { OverviewPage } from "@/overview/OverviewPage";
+import { SystemPage } from "@/system/SystemPage";
 import { ToastHost, ToastProvider } from "@/lib/toasts";
 
 // Routes:
@@ -11,6 +12,7 @@ import { ToastHost, ToastProvider } from "@/lib/toasts";
 //   /chat/:slotId  → ChatPage with the matching slot streaming
 //   /board         → BoardPage 4-lane Kanban
 //   /overview      → OverviewPage memory/cron/integrations/tools cards
+//   /system        → SystemPage live status, component health, cost
 export default function App() {
   return (
     <ControlUiBootstrapProvider>
@@ -21,6 +23,7 @@ export default function App() {
           <Route path="/chat/:slotId" element={<ChatPage />} />
           <Route path="/board" element={<BoardPage />} />
           <Route path="/overview" element={<OverviewPage />} />
+          <Route path="/system" element={<SystemPage />} />
         </Routes>
         <ToastHost />
       </ToastProvider>
