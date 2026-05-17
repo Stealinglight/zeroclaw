@@ -174,10 +174,10 @@ function HealthTable() {
           <table className="text-sm w-full">
             <thead>
               <tr style={{ color: "var(--color-text-muted)" }}>
-                <th className="text-left text-xs uppercase tracking-wide pb-2">Name</th>
-                <th className="text-left text-xs uppercase tracking-wide pb-2">Status</th>
-                <th className="text-left text-xs uppercase tracking-wide pb-2">Updated</th>
-                <th className="text-right text-xs uppercase tracking-wide pb-2">Restarts</th>
+                <th scope="col" className="text-left text-xs uppercase tracking-wide pb-2">Name</th>
+                <th scope="col" className="text-left text-xs uppercase tracking-wide pb-2">Status</th>
+                <th scope="col" className="text-left text-xs uppercase tracking-wide pb-2">Updated</th>
+                <th scope="col" className="text-right text-xs uppercase tracking-wide pb-2">Restarts</th>
               </tr>
             </thead>
             <tbody>
