@@ -14,7 +14,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::process::Command;
-use tracing::debug;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -472,7 +471,11 @@ impl BrowserTool {
         // Add --json for machine-readable output
         cmd.args(args).arg("--json");
 
-        debug!("Running: agent-browser {} --json", args.join(" "));
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("Running: agent-browser {} --json", args.join(" "))
+        );
 
         let output = cmd
             .stdout(Stdio::piped())
@@ -484,7 +487,11 @@ impl BrowserTool {
         let stderr = String::from_utf8_lossy(&output.stderr);
 
         if !stderr.is_empty() {
-            debug!("agent-browser stderr: {}", stderr);
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                &format!("agent-browser stderr: {}", stderr)
+            );
         }
 
         // Parse JSON response
@@ -1050,13 +1057,8 @@ impl Tool for BrowserTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         let backend = match self.resolve_backend().await {
             Ok(selected) => selected,

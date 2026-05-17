@@ -136,6 +136,8 @@ mod tests {
                 namespace: "default".into(),
                 importance: None,
                 superseded_by: None,
+                agent_alias: None,
+                agent_id: None,
             }])
         }
 
@@ -165,6 +167,41 @@ mod tests {
 
         fn name(&self) -> &str {
             "mock"
+        }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemory {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemory"
         }
     }
 
@@ -218,6 +255,41 @@ mod tests {
         fn name(&self) -> &str {
             "mock-with-entries"
         }
+
+        async fn store_with_agent(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+            _namespace: Option<&str>,
+            _importance: Option<f64>,
+            _agent_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn recall_for_agents(
+            &self,
+            _allowed_agent_ids: &[&str],
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+            since: Option<&str>,
+            until: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.recall(query, limit, session_id, since, until).await
+        }
+    }
+    impl ::zeroclaw_api::attribution::Attributable for MockMemoryWithEntries {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Memory(
+                ::zeroclaw_api::attribution::MemoryKind::InMemory,
+            )
+        }
+        fn alias(&self) -> &str {
+            "MockMemoryWithEntries"
+        }
     }
 
     #[tokio::test]
@@ -249,6 +321,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -261,6 +335,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
             ]),
         };
@@ -290,6 +366,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
                 MemoryEntry {
                     id: "2".into(),
@@ -302,6 +380,8 @@ mod tests {
                     namespace: "default".into(),
                     importance: None,
                     superseded_by: None,
+                    agent_alias: None,
+                    agent_id: None,
                 },
             ]),
         };

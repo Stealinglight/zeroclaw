@@ -4,20 +4,19 @@
 //! Provides full-text search via FTS5 and automatic TTL-based cleanup.
 //! Designed as the default backend, replacing JSONL for new installations.
 
-use crate::session_backend::{SessionBackend, SessionMetadata, SessionQuery, SessionState};
-use crate::slot::{Slot, SlotState, SlotStore, SlotUpdate};
+use crate::session_backend::{
+    SessionBackend, SessionContext, SessionMetadata, SessionQuery, SessionState,
+};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
 use rusqlite::{Connection, params};
-use std::path::{Path, PathBuf};
-use zeroclaw_api::provider::ChatMessage;
+use std::path::Path;
+use zeroclaw_api::model_provider::ChatMessage;
 
 /// SQLite-backed session store with FTS5 and WAL mode.
 pub struct SqliteSessionBackend {
     conn: Mutex<Connection>,
-    #[allow(dead_code)]
-    db_path: PathBuf,
 }
 
 impl SqliteSessionBackend {
@@ -109,34 +108,76 @@ impl SqliteSessionBackend {
             );
         }
 
-        // Migration: add slots table (M1). Additive — pre-existing session
-        // data remains untouched. `agent_config` is stored as JSON text so
-        // future fields can be added without a schema bump.
-        //
-        // No FK on session_key — slots can refer to memory sessions that
-        // don't exist yet when a slot is created ahead of its first turn.
-        // Cleanup of orphaned memory sessions is the caller's concern.
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS slots (
-                id              TEXT PRIMARY KEY,
-                session_id      TEXT NOT NULL,
-                title           TEXT NOT NULL,
-                agent_config    TEXT NOT NULL DEFAULT '{}',
-                state           TEXT NOT NULL DEFAULT 'idle',
-                created_at      INTEGER NOT NULL,
-                updated_at      INTEGER NOT NULL,
-                message_count   INTEGER NOT NULL DEFAULT 0,
-                dirty           INTEGER NOT NULL DEFAULT 0,
-                workspace       TEXT
-             );
-             CREATE INDEX IF NOT EXISTS idx_slots_session_id ON slots(session_id);
-             CREATE INDEX IF NOT EXISTS idx_slots_updated_at ON slots(updated_at DESC);",
-        )
-        .context("Failed to initialize slots schema")?;
+        // Migration: add agent_alias column for per-agent attribution
+        let has_agent_alias: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'agent_alias'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_agent_alias {
+            let _ = conn.execute(
+                "ALTER TABLE session_metadata ADD COLUMN agent_alias TEXT",
+                [],
+            );
+            let _ = conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_session_metadata_agent_alias \
+                 ON session_metadata(agent_alias)",
+                [],
+            );
+        }
+
+        // Migration: structured routing columns. Each session metadata row
+        // gets the channel ref (`<type>.<alias>` like `discord.clamps`),
+        // the platform-side room/thread id, and the inbound sender id so
+        // dashboard filters and audit queries don't have to re-parse the
+        // `session_key` composition that orchestrator::conversation_history_key
+        // builds.  All three are nullable for backfill compatibility.
+        for (column, ddl) in [
+            (
+                "channel_id",
+                "ALTER TABLE session_metadata ADD COLUMN channel_id TEXT",
+            ),
+            (
+                "room_id",
+                "ALTER TABLE session_metadata ADD COLUMN room_id TEXT",
+            ),
+            (
+                "sender_id",
+                "ALTER TABLE session_metadata ADD COLUMN sender_id TEXT",
+            ),
+        ] {
+            let present: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') \
+                     WHERE name = ?1",
+                    params![column],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if !present {
+                let _ = conn.execute(ddl, []);
+            }
+        }
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_channel_id \
+             ON session_metadata(channel_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_room_id \
+             ON session_metadata(room_id)",
+            [],
+        );
+        let _ = conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_metadata_sender_id \
+             ON session_metadata(sender_id)",
+            [],
+        );
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path,
         })
     }
 
@@ -208,6 +249,39 @@ impl SessionBackend for SqliteSessionBackend {
             Ok(ChatMessage {
                 role: row.get(0)?,
                 content: row.get(1)?,
+            })
+        }) {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        rows.filter_map(|r| r.ok()).collect()
+    }
+
+    fn load_with_timestamps(
+        &self,
+        session_key: &str,
+    ) -> Vec<crate::session_backend::TimestampedMessage> {
+        use crate::session_backend::TimestampedMessage;
+        let conn = self.conn.lock();
+        let mut stmt = match conn.prepare(
+            "SELECT role, content, created_at FROM sessions WHERE session_key = ?1 ORDER BY id ASC",
+        ) {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+
+        let rows = match stmt.query_map(params![session_key], |row| {
+            let role: String = row.get(0)?;
+            let content: String = row.get(1)?;
+            let created_at_raw: Option<String> = row.get(2).ok();
+            let created_at = created_at_raw
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc));
+            Ok(TimestampedMessage {
+                message: ChatMessage { role, content },
+                created_at,
             })
         }) {
             Ok(r) => r,
@@ -329,7 +403,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_sessions_with_metadata(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata ORDER BY last_activity DESC",
         ) {
             Ok(s) => s,
@@ -342,6 +416,10 @@ impl SessionBackend for SqliteSessionBackend {
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
             let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
 
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -357,6 +435,10 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
             })
         }) {
             Ok(r) => r,
@@ -472,7 +554,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn get_session_metadata(&self, session_key: &str) -> Option<SessionMetadata> {
         let conn = self.conn.lock();
         conn.query_row(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata WHERE session_key = ?1",
             params![session_key],
             |row| {
@@ -481,6 +563,10 @@ impl SessionBackend for SqliteSessionBackend {
                 let activity_str: String = row.get(2)?;
                 let count: i64 = row.get(3)?;
                 let name: Option<String> = row.get(4)?;
+                let agent_alias: Option<String> = row.get(5)?;
+                let channel_id: Option<String> = row.get(6)?;
+                let room_id: Option<String> = row.get(7)?;
+                let sender_id: Option<String> = row.get(8)?;
 
                 let created = DateTime::parse_from_rfc3339(&created_str)
                     .map(|dt| dt.with_timezone(&Utc))
@@ -496,6 +582,10 @@ impl SessionBackend for SqliteSessionBackend {
                     created_at: created,
                     last_activity: activity,
                     message_count: count as usize,
+                    agent_alias,
+                    channel_id,
+                    room_id,
+                    sender_id,
                 })
             },
         )
@@ -555,7 +645,7 @@ impl SessionBackend for SqliteSessionBackend {
     fn list_running_sessions(&self) -> Vec<SessionMetadata> {
         let conn = self.conn.lock();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata WHERE state = 'running' ORDER BY turn_started_at DESC",
         ) {
             Ok(s) => s,
@@ -568,6 +658,10 @@ impl SessionBackend for SqliteSessionBackend {
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
             let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -581,6 +675,10 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
             })
         }) {
             Ok(r) => r,
@@ -595,7 +693,7 @@ impl SessionBackend for SqliteSessionBackend {
         #[allow(clippy::cast_possible_wrap)]
         let cutoff = (Utc::now() - chrono::Duration::seconds(threshold_secs as i64)).to_rfc3339();
         let mut stmt = match conn.prepare(
-            "SELECT session_key, created_at, last_activity, message_count, name
+            "SELECT session_key, created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id
              FROM session_metadata
              WHERE state = 'running' AND turn_started_at < ?1
              ORDER BY turn_started_at ASC",
@@ -610,6 +708,10 @@ impl SessionBackend for SqliteSessionBackend {
             let activity_str: String = row.get(2)?;
             let count: i64 = row.get(3)?;
             let name: Option<String> = row.get(4)?;
+            let agent_alias: Option<String> = row.get(5)?;
+            let channel_id: Option<String> = row.get(6)?;
+            let room_id: Option<String> = row.get(7)?;
+            let sender_id: Option<String> = row.get(8)?;
             let created = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
@@ -623,6 +725,10 @@ impl SessionBackend for SqliteSessionBackend {
                 created_at: created,
                 last_activity: activity,
                 message_count: count as usize,
+                agent_alias,
+                channel_id,
+                room_id,
+                sender_id,
             })
         }) {
             Ok(r) => r,
@@ -668,13 +774,17 @@ impl SessionBackend for SqliteSessionBackend {
         keys.iter()
             .filter_map(|key| {
                 conn.query_row(
-                    "SELECT created_at, last_activity, message_count, name FROM session_metadata WHERE session_key = ?1",
+                    "SELECT created_at, last_activity, message_count, name, agent_alias, channel_id, room_id, sender_id FROM session_metadata WHERE session_key = ?1",
                     params![key],
                     |row| {
                         let created_str: String = row.get(0)?;
                         let activity_str: String = row.get(1)?;
                         let count: i64 = row.get(2)?;
                         let name: Option<String> = row.get(3)?;
+                        let agent_alias: Option<String> = row.get(4)?;
+                        let channel_id: Option<String> = row.get(5)?;
+                        let room_id: Option<String> = row.get(6)?;
+                        let sender_id: Option<String> = row.get(7)?;
                         Ok(SessionMetadata {
                             key: key.clone(),
                             name,
@@ -686,6 +796,10 @@ impl SessionBackend for SqliteSessionBackend {
                                 .unwrap_or_else(|_| Utc::now()),
                             #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
                             message_count: count as usize,
+                            agent_alias,
+                            channel_id,
+                            room_id,
+                            sender_id,
                         })
                     },
                 )
@@ -693,219 +807,68 @@ impl SessionBackend for SqliteSessionBackend {
             })
             .collect()
     }
-}
 
-// ── SlotStore (M1: multi-session dashboard) ─────────────────────────────
-
-fn slot_state_to_str(state: SlotState) -> &'static str {
-    match state {
-        SlotState::Idle => "idle",
-        SlotState::Running => "running",
-        SlotState::WaitingApproval => "waiting_approval",
-        SlotState::Error => "error",
-    }
-}
-
-fn slot_state_from_str(s: &str) -> SlotState {
-    match s {
-        "running" => SlotState::Running,
-        "waiting_approval" => SlotState::WaitingApproval,
-        "error" => SlotState::Error,
-        _ => SlotState::Idle,
-    }
-}
-
-fn row_to_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Slot> {
-    let id: String = row.get(0)?;
-    let session_id: String = row.get(1)?;
-    let title: String = row.get(2)?;
-    let agent_config_json: String = row.get(3)?;
-    let state_str: String = row.get(4)?;
-    let created_at: i64 = row.get(5)?;
-    let updated_at: i64 = row.get(6)?;
-    let message_count: i64 = row.get(7)?;
-    let dirty_int: i64 = row.get(8)?;
-    let workspace: Option<String> = row.get(9)?;
-
-    let agent_config = serde_json::from_str(&agent_config_json).map_err(|err| {
-        rusqlite::Error::FromSqlConversionFailure(
-            3,
-            rusqlite::types::Type::Text,
-            Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("failed to deserialize agent_config for slot {id}: {err}"),
-            )),
-        )
-    })?;
-
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    Ok(Slot {
-        id,
-        session_id,
-        title,
-        agent_config,
-        state: slot_state_from_str(&state_str),
-        created_at,
-        updated_at,
-        message_count: message_count.max(0) as usize,
-        dirty: dirty_int != 0,
-        workspace,
-    })
-}
-
-impl SlotStore for SqliteSessionBackend {
-    fn create_slot(&self, slot: &Slot) -> std::io::Result<()> {
+    fn set_session_agent_alias(&self, session_key: &str, agent_alias: &str) -> std::io::Result<()> {
         let conn = self.conn.lock();
-        let agent_config_json =
-            serde_json::to_string(&slot.agent_config).map_err(std::io::Error::other)?;
-        #[allow(clippy::cast_possible_wrap)]
-        let message_count = slot.message_count as i64;
-
+        let alias_val = if agent_alias.is_empty() {
+            None
+        } else {
+            Some(agent_alias)
+        };
+        let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO slots
-                (id, session_id, title, agent_config, state,
-                 created_at, updated_at, message_count, dirty, workspace)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-            params![
-                slot.id,
-                slot.session_id,
-                slot.title,
-                agent_config_json,
-                slot_state_to_str(slot.state),
-                slot.created_at,
-                slot.updated_at,
-                message_count,
-                i32::from(slot.dirty),
-                slot.workspace,
-            ],
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, agent_alias)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(session_key) DO UPDATE SET agent_alias = excluded.agent_alias",
+            params![session_key, now, now, alias_val],
         )
         .map_err(std::io::Error::other)?;
         Ok(())
     }
 
-    fn get_slot(&self, slot_id: &str) -> std::io::Result<Option<Slot>> {
+    fn get_session_agent_alias(&self, session_key: &str) -> std::io::Result<Option<String>> {
         let conn = self.conn.lock();
-        let row = conn.query_row(
-            "SELECT id, session_id, title, agent_config, state,
-                    created_at, updated_at, message_count, dirty, workspace
-             FROM slots WHERE id = ?1",
-            params![slot_id],
-            row_to_slot,
-        );
-        match row {
-            Ok(slot) => Ok(Some(slot)),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-            Err(e) => Err(std::io::Error::other(e)),
-        }
+        conn.query_row(
+            "SELECT agent_alias FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| row.get(0),
+        )
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(std::io::Error::other(other)),
+        })
     }
 
-    fn list_slots(&self) -> std::io::Result<Vec<Slot>> {
+    fn set_session_context(
+        &self,
+        session_key: &str,
+        context: SessionContext<'_>,
+    ) -> std::io::Result<()> {
         let conn = self.conn.lock();
-        let mut stmt = conn
-            .prepare(
-                "SELECT id, session_id, title, agent_config, state,
-                        created_at, updated_at, message_count, dirty, workspace
-                 FROM slots ORDER BY updated_at DESC, id ASC",
-            )
-            .map_err(std::io::Error::other)?;
-
-        let rows = stmt
-            .query_map([], row_to_slot)
-            .map_err(std::io::Error::other)?;
-
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row.map_err(std::io::Error::other)?);
+        fn normalize(v: Option<&str>) -> Option<&str> {
+            v.map(str::trim).filter(|s| !s.is_empty())
         }
-        Ok(out)
-    }
-
-    fn update_slot(&self, slot_id: &str, update: &SlotUpdate) -> std::io::Result<Option<Slot>> {
-        let now = Utc::now().timestamp();
-        let conn = self.conn.lock();
-
-        // Fetch the existing slot so unspecified fields keep their values.
-        // Use a single SELECT then UPDATE rather than N per-field updates to
-        // keep the operation atomic-enough under the connection mutex.
-        let existing_row = conn.query_row(
-            "SELECT id, session_id, title, agent_config, state,
-                    created_at, updated_at, message_count, dirty, workspace
-             FROM slots WHERE id = ?1",
-            params![slot_id],
-            row_to_slot,
-        );
-        let mut existing = match existing_row {
-            Ok(s) => s,
-            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
-            Err(e) => return Err(std::io::Error::other(e)),
-        };
-
-        if let Some(t) = &update.title {
-            existing.title = t.clone();
-        }
-        if let Some(cfg) = &update.agent_config {
-            existing.agent_config = cfg.clone();
-        }
-        if let Some(state) = update.state {
-            existing.state = state;
-        }
-        // `clear_workspace` takes precedence so callers can send
-        // `{"clear_workspace": true}` and null out the label. JSON's
-        // lack of tri-state for `Option<String>` is why this flag exists.
-        if update.clear_workspace {
-            existing.workspace = None;
-        } else if let Some(ws) = &update.workspace {
-            existing.workspace = Some(ws.clone());
-        }
-        if let Some(dirty) = update.dirty {
-            existing.dirty = dirty;
-        }
-        if let Some(count) = update.message_count {
-            existing.message_count = count;
-        }
-        existing.updated_at = now;
-
-        let agent_config_json =
-            serde_json::to_string(&existing.agent_config).map_err(std::io::Error::other)?;
-        #[allow(clippy::cast_possible_wrap)]
-        let message_count = existing.message_count as i64;
-
+        let channel_id = normalize(context.channel_id);
+        let room_id = normalize(context.room_id);
+        let sender_id = normalize(context.sender_id);
+        let now = Utc::now().to_rfc3339();
+        // Insert a metadata stub row when missing so the per-platform
+        // fields land even before the first message append fires the
+        // upsert path. The COALESCE clauses preserve any field a prior
+        // append/set already stamped — channel-side updates only fill in
+        // gaps, they don't overwrite earlier routing context.
         conn.execute(
-            "UPDATE slots SET
-                title = ?1, agent_config = ?2, state = ?3,
-                updated_at = ?4, message_count = ?5, dirty = ?6, workspace = ?7
-             WHERE id = ?8",
-            params![
-                existing.title,
-                agent_config_json,
-                slot_state_to_str(existing.state),
-                existing.updated_at,
-                message_count,
-                i32::from(existing.dirty),
-                existing.workspace,
-                slot_id,
-            ],
+            "INSERT INTO session_metadata
+                (session_key, created_at, last_activity, message_count, channel_id, room_id, sender_id)
+             VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)
+             ON CONFLICT(session_key) DO UPDATE SET
+                channel_id = COALESCE(excluded.channel_id, session_metadata.channel_id),
+                room_id    = COALESCE(excluded.room_id,    session_metadata.room_id),
+                sender_id  = COALESCE(excluded.sender_id,  session_metadata.sender_id)",
+            params![session_key, now, now, channel_id, room_id, sender_id],
         )
         .map_err(std::io::Error::other)?;
-
-        Ok(Some(existing))
-    }
-
-    fn delete_slot(&self, slot_id: &str) -> std::io::Result<bool> {
-        let conn = self.conn.lock();
-        let rows = conn
-            .execute("DELETE FROM slots WHERE id = ?1", params![slot_id])
-            .map_err(std::io::Error::other)?;
-        Ok(rows > 0)
-    }
-
-    fn count_slots(&self) -> std::io::Result<usize> {
-        let conn = self.conn.lock();
-        let count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM slots", [], |row| row.get(0))
-            .map_err(std::io::Error::other)?;
-        #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-        Ok(count.max(0) as usize)
+        Ok(())
     }
 }
 
@@ -1385,202 +1348,99 @@ mod tests {
         assert!(backend.get_session_metadata("nonexistent").is_none());
     }
 
-    // ── SlotStore tests ───────────────────────────────────────────
-
-    fn make_slot(id: &str) -> Slot {
-        let now = Utc::now().timestamp();
-        Slot::new(id.into(), format!("gw_{id}"), format!("Slot {id}"), now)
-    }
-
     #[test]
-    fn slot_create_and_get_roundtrip() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let slot = make_slot("alpha");
-        backend.create_slot(&slot).unwrap();
-        let loaded = backend.get_slot("alpha").unwrap().expect("slot exists");
-        assert_eq!(loaded, slot);
-    }
-
-    #[test]
-    fn slot_get_returns_none_for_missing() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        assert!(backend.get_slot("no-such").unwrap().is_none());
-    }
-
-    #[test]
-    fn slot_list_sorts_by_updated_at_desc() {
+    fn agent_alias_roundtrips_through_metadata() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
 
-        let mut a = make_slot("a");
-        a.updated_at = 100;
-        let mut b = make_slot("b");
-        b.updated_at = 200;
-        let mut c = make_slot("c");
-        c.updated_at = 150;
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend.set_session_agent_alias("s1", "scout").unwrap();
 
-        backend.create_slot(&a).unwrap();
-        backend.create_slot(&b).unwrap();
-        backend.create_slot(&c).unwrap();
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.agent_alias.as_deref(), Some("scout"));
 
-        let slots = backend.list_slots().unwrap();
-        let ids: Vec<_> = slots.iter().map(|s| s.id.as_str()).collect();
-        assert_eq!(ids, vec!["b", "c", "a"]);
+        let listed = backend.list_sessions_with_metadata();
+        let row = listed.iter().find(|m| m.key == "s1").unwrap();
+        assert_eq!(row.agent_alias.as_deref(), Some("scout"));
+
+        // Standalone getter also works.
+        let alias = backend.get_session_agent_alias("s1").unwrap();
+        assert_eq!(alias.as_deref(), Some("scout"));
     }
 
     #[test]
-    fn slot_update_patches_only_requested_fields() {
+    fn agent_alias_set_before_any_append_upserts_metadata() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let mut slot = make_slot("x");
-        slot.title = "Original".into();
-        backend.create_slot(&slot).unwrap();
 
-        let updated = backend
-            .update_slot(
-                "x",
-                &SlotUpdate {
-                    title: Some("Renamed".into()),
-                    ..SlotUpdate::default()
-                },
-            )
-            .unwrap()
-            .expect("slot exists");
-        assert_eq!(updated.title, "Renamed");
-        assert_eq!(updated.session_id, slot.session_id); // unchanged
-        assert!(updated.updated_at >= slot.updated_at);
+        // No prior append — metadata row does not exist yet. UPSERT
+        // path must still record the alias so the WS handshake can
+        // attribute the session before the first user message lands.
+        backend.set_session_agent_alias("s1", "scout").unwrap();
+
+        let alias = backend.get_session_agent_alias("s1").unwrap();
+        assert_eq!(alias.as_deref(), Some("scout"));
     }
 
     #[test]
-    fn slot_update_returns_none_for_missing() {
+    fn session_context_roundtrips_channel_room_sender() {
         let tmp = TempDir::new().unwrap();
         let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let res = backend
-            .update_slot(
-                "nope",
-                &SlotUpdate {
-                    title: Some("hi".into()),
-                    ..SlotUpdate::default()
+
+        backend.append("s1", &ChatMessage::user("hello")).unwrap();
+        backend
+            .set_session_context(
+                "s1",
+                SessionContext {
+                    channel_id: Some("discord.clamps"),
+                    room_id: Some("1234567890"),
+                    sender_id: Some("@user:matrix"),
                 },
             )
             .unwrap();
-        assert!(res.is_none());
-    }
 
-    #[test]
-    fn slot_delete_removes_and_reports() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        backend.create_slot(&make_slot("a")).unwrap();
-        backend.create_slot(&make_slot("b")).unwrap();
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.channel_id.as_deref(), Some("discord.clamps"));
+        assert_eq!(meta.room_id.as_deref(), Some("1234567890"));
+        assert_eq!(meta.sender_id.as_deref(), Some("@user:matrix"));
 
-        assert!(backend.delete_slot("a").unwrap());
-        assert!(!backend.delete_slot("a").unwrap()); // second delete is a no-op
-        let remaining = backend.list_slots().unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].id, "b");
-    }
-
-    #[test]
-    fn slot_count_tracks_inserts_and_deletes() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        assert_eq!(backend.count_slots().unwrap(), 0);
-        for i in 0..5 {
-            backend.create_slot(&make_slot(&format!("s{i}"))).unwrap();
-        }
-        assert_eq!(backend.count_slots().unwrap(), 5);
-        backend.delete_slot("s2").unwrap();
-        assert_eq!(backend.count_slots().unwrap(), 4);
-    }
-
-    #[test]
-    fn slot_agent_config_serializes_round_trip() {
-        use crate::slot::{SlotAgentConfig, SlotMode};
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let mut slot = make_slot("cfg");
-        slot.agent_config = SlotAgentConfig {
-            provider: Some("anthropic".into()),
-            model: Some("claude-3-5-sonnet".into()),
-            mode: SlotMode::Trust,
-            personality: Some("SOUL.md".into()),
-            persona_preset: Some("codex-researcher".into()),
-        };
-        backend.create_slot(&slot).unwrap();
-        let loaded = backend.get_slot("cfg").unwrap().unwrap();
-        assert_eq!(loaded.agent_config, slot.agent_config);
-    }
-
-    #[test]
-    fn slot_state_roundtrips_through_sqlite() {
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-
-        for state in [
-            SlotState::Idle,
-            SlotState::Running,
-            SlotState::WaitingApproval,
-            SlotState::Error,
-        ] {
-            let mut slot = make_slot(&format!("{state:?}").to_lowercase());
-            slot.state = state;
-            backend.create_slot(&slot).unwrap();
-            let loaded = backend.get_slot(&slot.id).unwrap().unwrap();
-            assert_eq!(loaded.state, state, "state {state:?} failed to roundtrip");
-        }
-    }
-
-    #[test]
-    fn slot_migration_is_idempotent_on_reopen() {
-        // Opening the backend twice in the same workspace must not fail the
-        // CREATE TABLE IF NOT EXISTS and must preserve slot data between
-        // opens.
-        let tmp = TempDir::new().unwrap();
-        {
-            let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-            backend.create_slot(&make_slot("keep-me")).unwrap();
-        }
-        let reopened = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let slot = reopened.get_slot("keep-me").unwrap();
-        assert!(slot.is_some(), "slot data must survive reopen");
-    }
-
-    #[test]
-    fn slot_migration_preserves_pre_existing_session_data() {
-        // Before M1, backends only stored sessions. M1 must not destroy or
-        // corrupt session data. Populate sessions, then add a slot, then
-        // confirm sessions still load.
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+        // Second call with partial context must NOT clear the columns
+        // already filled in — set_session_context is additive.
         backend
-            .append("legacy", &ChatMessage::user("hello"))
+            .set_session_context(
+                "s1",
+                SessionContext {
+                    channel_id: None,
+                    room_id: Some("1234567890"),
+                    sender_id: None,
+                },
+            )
             .unwrap();
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.channel_id.as_deref(), Some("discord.clamps"));
+        assert_eq!(meta.sender_id.as_deref(), Some("@user:matrix"));
+    }
+
+    #[test]
+    fn session_context_creates_metadata_row_before_first_append() {
+        let tmp = TempDir::new().unwrap();
+        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
+
         backend
-            .append("legacy", &ChatMessage::assistant("hi"))
+            .set_session_context(
+                "s1",
+                SessionContext {
+                    channel_id: Some("telegram.production"),
+                    room_id: None,
+                    sender_id: Some("@alice"),
+                },
+            )
             .unwrap();
 
-        backend.create_slot(&make_slot("new-slot")).unwrap();
-
-        let msgs = backend.load("legacy");
-        assert_eq!(msgs.len(), 2, "session data must survive slot migration");
-        assert_eq!(msgs[0].content, "hello");
-        assert_eq!(msgs[1].content, "hi");
-    }
-
-    #[test]
-    fn slot_agent_config_none_fields_serialize_compactly() {
-        // Slots with all-default agent config should still load correctly
-        // and present empty overrides (None everywhere) to callers.
-        let tmp = TempDir::new().unwrap();
-        let backend = SqliteSessionBackend::new(tmp.path()).unwrap();
-        let slot = make_slot("empty-cfg");
-        backend.create_slot(&slot).unwrap();
-        let loaded = backend.get_slot("empty-cfg").unwrap().unwrap();
-        assert!(loaded.agent_config.provider.is_none());
-        assert!(loaded.agent_config.model.is_none());
+        let meta = backend.get_session_metadata("s1").unwrap();
+        assert_eq!(meta.channel_id.as_deref(), Some("telegram.production"));
+        assert_eq!(meta.sender_id.as_deref(), Some("@alice"));
+        assert!(meta.room_id.is_none());
     }
 
     #[test]

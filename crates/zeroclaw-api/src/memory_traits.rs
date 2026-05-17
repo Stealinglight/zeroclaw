@@ -44,6 +44,24 @@ pub struct MemoryEntry {
     /// If this entry was superseded by a newer conflicting entry.
     #[serde(default)]
     pub superseded_by: Option<String>,
+    /// Resolved, human-readable agent alias for this row (the HashMap key
+    /// in `Config::agents`, e.g. `"clamps"`). SQL-backed stores produce
+    /// this via `LEFT JOIN agents ON agents.id = memories.agent_id`;
+    /// Markdown / Qdrant / None backends populate it with the raw column
+    /// value (which is itself the alias for those backends).
+    ///
+    /// Use this field for display / routing. For scope-equality checks
+    /// (e.g. inside `AgentScopedMemory`) use [`MemoryEntry::agent_id`]
+    /// instead since that's stable across backend kinds (UUID for SQL,
+    /// alias for non-SQL).
+    #[serde(default)]
+    pub agent_alias: Option<String>,
+    /// Raw value of the storage layer's agent column. For SQL backends
+    /// this is the `memories.agent_id` UUID FK to `agents.id`; for
+    /// Markdown / Qdrant / None this is the alias string. The scoping
+    /// wrapper compares on this field so backend-kind doesn't matter.
+    #[serde(default, alias = "agent_id")]
+    pub agent_id: Option<String>,
 }
 
 fn default_namespace() -> String {
@@ -61,6 +79,7 @@ impl std::fmt::Debug for MemoryEntry {
             .field("score", &self.score)
             .field("namespace", &self.namespace)
             .field("importance", &self.importance)
+            .field("agent_alias", &self.agent_alias)
             .finish_non_exhaustive()
     }
 }
@@ -127,7 +146,7 @@ pub fn normalize_recent_recall_query(query: &str) -> &str {
 
 /// Core memory trait — implement for any persistence backend
 #[async_trait]
-pub trait Memory: Send + Sync {
+pub trait Memory: Send + Sync + crate::attribution::Attributable {
     /// Backend name
     fn name(&self) -> &str;
 
@@ -179,6 +198,17 @@ pub trait Memory: Send + Sync {
     /// Default: returns unsupported error. Backends that support bulk deletion override this.
     async fn purge_session(&self, _session_id: &str) -> anyhow::Result<usize> {
         anyhow::bail!("purge_session not supported by this memory backend")
+    }
+
+    /// Remove every memory row attributed to the given agent alias.
+    /// Returns the number of deleted entries. Called when an agent alias is
+    /// removed from `[agents.<alias>]` so the database doesn't accumulate
+    /// rows for retired aliases.
+    /// Default: returns unsupported error. Backends with per-agent storage
+    /// (sqlite, postgres) override this; backends without (markdown, none)
+    /// keep the default and the caller logs a warning.
+    async fn purge_agent(&self, _agent_alias: &str) -> anyhow::Result<usize> {
+        anyhow::bail!("purge_agent not supported by this memory backend")
     }
 
     /// Count total memories
@@ -289,6 +319,68 @@ pub trait Memory: Send + Sync {
     ) -> anyhow::Result<()> {
         self.store(key, content, category, session_id).await
     }
+
+    /// Store a memory entry attributed to an explicit agent UUID.
+    /// Every backend must implement this explicitly so the agent_id
+    /// is never silently dropped at storage time. Backends with
+    /// native agent_id columns (SqliteMemory, PostgresMemory,
+    /// LucidMemory) persist the attribution in SQL; MarkdownMemory
+    /// attributes via the per-agent directory path; QdrantMemory
+    /// persists in the vector payload; NoneMemory is a no-op stub.
+    /// `AgentScopedMemory` is the canonical caller.
+    async fn store_with_agent(
+        &self,
+        key: &str,
+        content: &str,
+        category: MemoryCategory,
+        session_id: Option<&str>,
+        namespace: Option<&str>,
+        importance: Option<f64>,
+        agent_id: Option<&str>,
+    ) -> anyhow::Result<()>;
+
+    /// Recall memory entries scoped to a specific set of agent UUIDs.
+    /// When `allowed_agent_ids` is non-empty, the backend filters its
+    /// result set to rows whose `agent_id` matches one of the listed
+    /// UUIDs (or is NULL, for legacy rows written before the agent_id
+    /// column existed). Every backend must implement this explicitly
+    /// so the allowlist is never silently dropped at read time.
+    ///
+    /// For SQL-backed stores the filter is `WHERE agent_id IN (...)`.
+    /// For Markdown the implementation walks the allowed agents'
+    /// per-agent directories. For Qdrant it's a payload filter on
+    /// the `agent_id` field. For None it returns an empty list.
+    /// `AgentScopedMemory` is the canonical caller; direct invocation
+    /// is also valid for read-only cross-agent queries that bypass
+    /// the wrapper.
+    ///
+    /// Cross-backend allowlist entries are rejected at config load
+    /// (`agents.<alias>.workspace.read_memory_from` cannot point at a
+    /// sibling on a different memory backend); backends therefore
+    /// never need to handle a cross-backend recall.
+    async fn recall_for_agents(
+        &self,
+        allowed_agent_ids: &[&str],
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        since: Option<&str>,
+        until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>>;
+
+    /// Look up (or create) the identifier the backend uses to refer
+    /// to the agent named by `alias`.
+    ///
+    /// Backends with an `agents` table (SqliteMemory, PostgresMemory,
+    /// LucidMemory) return the row's UUID, inserting if absent.
+    /// Backends without (MarkdownMemory, QdrantMemory, NoneMemory)
+    /// return the alias verbatim — there is no UUID indirection at
+    /// the storage layer, so the alias serves as the agent_id.
+    /// Default impl returns the alias unchanged; SQL backends
+    /// override to do the real lookup.
+    async fn ensure_agent_uuid(&self, alias: &str) -> anyhow::Result<String> {
+        Ok(alias.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +431,8 @@ mod tests {
             namespace: "default".into(),
             importance: Some(0.7),
             superseded_by: None,
+            agent_alias: None,
+            agent_id: None,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

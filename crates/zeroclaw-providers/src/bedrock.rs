@@ -1,4 +1,4 @@
-//! AWS Bedrock provider using the Converse API.
+//! AWS Bedrock model_provider using the Converse API.
 //!
 //! Authentication: supports three methods:
 //! - **Bearer token**: set `BEDROCK_API_KEY` env var (takes precedence).
@@ -9,7 +9,7 @@
 
 use crate::traits::{
     ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse,
-    Provider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
+    ModelProvider, ProviderCapabilities, TokenUsage, ToolCall as ProviderToolCall, ToolsPayload,
 };
 use async_trait::async_trait;
 use hmac::{Hmac, Mac};
@@ -147,7 +147,11 @@ impl AwsCredentials {
             .or(config_region)
             .unwrap_or_else(|| DEFAULT_REGION.to_string());
 
-        tracing::debug!("Loaded AWS credentials via credential_process");
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "Loaded AWS credentials via credential_process"
+        );
 
         Ok(Self {
             access_key_id,
@@ -225,9 +229,13 @@ impl AwsCredentials {
             region.trim().to_string()
         };
 
-        tracing::info!(
-            "Loaded AWS credentials from EC2 instance metadata (role: {})",
-            role
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "Loaded AWS credentials from EC2 instance metadata (role: {})",
+                role
+            )
         );
 
         Ok(Self {
@@ -631,67 +639,67 @@ struct ResponseToolUseWrapper {
     tool_use: ToolUseBlock,
 }
 
-// ── BedrockProvider ─────────────────────────────────────────────
+// ── BedrockModelProvider ─────────────────────────────────────────────
 
-pub struct BedrockProvider {
+pub struct BedrockModelProvider {
+    /// `[model_providers.<family>.<alias>]` config-key alias.
+    alias: String,
     auth: Option<BedrockAuth>,
     max_tokens: u32,
     /// Cached SigV4 credentials from `credential_process` (with expiry).
     cred_cache: Mutex<Option<AwsCredentials>>,
 }
 
-impl Default for BedrockProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl BedrockProvider {
-    pub fn new() -> Self {
+impl BedrockModelProvider {
+    pub fn new(alias: &str) -> Self {
         // Bearer token takes precedence over SigV4 credentials.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
+                alias: alias.to_string(),
                 auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
                 cred_cache: Mutex::new(None),
             };
         }
         Self {
+            alias: alias.to_string(),
             auth: AwsCredentials::from_env()
                 .or_else(|_| AwsCredentials::from_credential_process())
                 .ok()
                 .map(BedrockAuth::SigV4),
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         }
     }
 
-    pub async fn new_async() -> Self {
+    pub async fn new_async(alias: &str) -> Self {
         // Bearer token takes precedence over SigV4 credentials.
         if let Some(token) = env_optional("BEDROCK_API_KEY") {
             return Self {
+                alias: alias.to_string(),
                 auth: Some(BedrockAuth::BearerToken(token)),
-                max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+                max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
                 cred_cache: Mutex::new(None),
             };
         }
         let auth = AwsCredentials::resolve().await.ok().map(BedrockAuth::SigV4);
         Self {
+            alias: alias.to_string(),
             auth,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         }
     }
 
-    /// Create a provider using a Bearer token for authentication.
-    pub fn with_bearer_token(token: &str) -> Self {
+    /// Create a model_provider using a Bearer token for authentication.
+    pub fn with_bearer_token(alias: &str, token: &str) -> Self {
         Self {
+            alias: alias.to_string(),
             auth: Some(BedrockAuth::BearerToken(token.to_string())),
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         }
     }
-
     /// Override the maximum output tokens for API requests.
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
@@ -700,7 +708,7 @@ impl BedrockProvider {
 
     fn http_client(&self) -> Client {
         zeroclaw_config::schema::build_runtime_proxy_client_with_timeouts(
-            "provider.bedrock",
+            "model_provider.bedrock",
             120,
             10,
         )
@@ -780,7 +788,7 @@ impl BedrockProvider {
         Ok(BedrockAuth::SigV4(AwsCredentials::from_imds().await?))
     }
 
-    // ── Cache heuristics (same thresholds as AnthropicProvider) ──
+    // ── Cache heuristics (same thresholds as AnthropicModelProvider) ──
 
     /// Cache system prompts larger than ~1024 tokens (3KB of text).
     fn should_cache_system(text: &str) -> bool {
@@ -841,10 +849,18 @@ impl BedrockProvider {
                                 .or_else(|| Self::last_pending_tool_use_id(&converse_messages))
                                 .unwrap_or_else(|| "unknown".to_string());
 
-                            tracing::warn!(
-                                "Failed to parse tool result message, creating error \
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                                &format!(
+                                    "Failed to parse tool result message, creating error \
                                  toolResult for tool_use_id={}",
-                                tool_use_id
+                                    tool_use_id
+                                )
                             );
 
                             ConverseMessage {
@@ -968,10 +984,14 @@ impl BedrockProvider {
         let mut blocks: Vec<ContentBlock> = Vec::new();
         let mut remaining = content;
         let has_image = content.contains("[IMAGE:");
-        tracing::info!(
-            "parse_user_content_blocks called, len={}, has_image={}",
-            content.len(),
-            has_image
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "parse_user_content_blocks called, len={}, has_image={}",
+                content.len(),
+                has_image
+            )
         );
 
         while let Some(start) = remaining.find("[IMAGE:") {
@@ -1249,9 +1269,16 @@ impl BedrockProvider {
                             {
                                 *bytes = serde_json::json!(format!("<base64 {} chars>", s.len()));
                             }
-                            tracing::info!(
-                                "Bedrock image block: {}",
-                                serde_json::to_string(&b).unwrap_or_default()
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                ),
+                                &format!(
+                                    "Bedrock image block: {}",
+                                    serde_json::to_string(&b).unwrap_or_default()
+                                )
                             );
                         }
                     }
@@ -1324,10 +1351,10 @@ impl BedrockProvider {
     }
 }
 
-// ── Provider trait implementation ───────────────────────────────
+// ── ModelProvider trait implementation ───────────────────────────────
 
 #[async_trait]
-impl Provider for BedrockProvider {
+impl ModelProvider for BedrockModelProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             native_tool_calling: true,
@@ -1512,6 +1539,19 @@ impl Provider for BedrockProvider {
 
 // ── Tests ───────────────────────────────────────────────────────
 
+impl ::zeroclaw_api::attribution::Attributable for BedrockModelProvider {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Provider(
+            ::zeroclaw_api::attribution::ProviderKind::Model(
+                ::zeroclaw_api::attribution::ModelProviderKind::Bedrock,
+            ),
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1662,12 +1702,12 @@ mod tests {
         assert_eq!(creds.host(), "bedrock-runtime.us-west-2.amazonaws.com");
     }
 
-    // ── Provider construction tests ─────────────────────────────
+    // ── ModelProvider construction tests ─────────────────────────────
 
     #[test]
     fn creates_without_credentials() {
-        // Provider should construct even without env vars.
-        let _provider = BedrockProvider::new();
+        // ModelProvider should construct even without env vars.
+        let _provider = BedrockModelProvider::new("test");
     }
 
     #[tokio::test]
@@ -1678,12 +1718,13 @@ mod tests {
         let _sk = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
         let _bearer = EnvGuard::set("BEDROCK_API_KEY", None);
         let _config = EnvGuard::set("AWS_CONFIG_FILE", Some("/dev/null"));
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         };
-        let result = provider
+        let result = model_provider
             .chat_with_system(None, "hello", "anthropic.claude-sonnet-4-6", Some(0.7))
             .await;
         assert!(result.is_err());
@@ -1701,10 +1742,10 @@ mod tests {
 
     #[test]
     fn creates_with_bearer_token() {
-        let provider = BedrockProvider::with_bearer_token("test-api-key");
-        assert!(provider.auth.is_some());
+        let model_provider = BedrockModelProvider::with_bearer_token("test", "test-api-key");
+        assert!(model_provider.auth.is_some());
         assert!(
-            matches!(provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
+            matches!(model_provider.auth, Some(BedrockAuth::BearerToken(ref t)) if t == "test-api-key")
         );
     }
 
@@ -1716,9 +1757,9 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", None);
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", None);
 
-        let provider = BedrockProvider::new();
+        let model_provider = BedrockModelProvider::new("test");
         assert!(matches!(
-            provider.auth,
+            model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "env-bearer-token"
         ));
     }
@@ -1730,10 +1771,10 @@ mod tests {
         let _ak_guard = EnvGuard::set("AWS_ACCESS_KEY_ID", Some("AKIAEXAMPLE"));
         let _sk_guard = EnvGuard::set("AWS_SECRET_ACCESS_KEY", Some("secret"));
 
-        let provider = BedrockProvider::new();
+        let model_provider = BedrockModelProvider::new("test");
         // Bearer token should take priority over SigV4 credentials.
         assert!(matches!(
-            provider.auth,
+            model_provider.auth,
             Some(BedrockAuth::BearerToken(ref t)) if t == "bearer-key"
         ));
     }
@@ -1742,7 +1783,7 @@ mod tests {
 
     #[test]
     fn endpoint_url_formats_correctly() {
-        let url = BedrockProvider::endpoint_url("us-east-1", "anthropic.claude-sonnet-4-6");
+        let url = BedrockModelProvider::endpoint_url("us-east-1", "anthropic.claude-sonnet-4-6");
         assert_eq!(
             url,
             "https://bedrock-runtime.us-east-1.amazonaws.com/model/anthropic.claude-sonnet-4-6/converse"
@@ -1752,15 +1793,17 @@ mod tests {
     #[test]
     fn endpoint_url_keeps_raw_colon() {
         // Endpoint URL uses raw colon so reqwest sends `:` on the wire.
-        let url =
-            BedrockProvider::endpoint_url("us-west-2", "anthropic.claude-3-5-haiku-20241022-v1:0");
+        let url = BedrockModelProvider::endpoint_url(
+            "us-west-2",
+            "anthropic.claude-3-5-haiku-20241022-v1:0",
+        );
         assert!(url.contains("/model/anthropic.claude-3-5-haiku-20241022-v1:0/converse"));
     }
 
     #[test]
     fn canonical_uri_encodes_colon() {
         // Canonical URI must encode `:` as `%3A` for SigV4 signing.
-        let uri = BedrockProvider::canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
+        let uri = BedrockModelProvider::canonical_uri("anthropic.claude-3-5-haiku-20241022-v1:0");
         assert_eq!(
             uri,
             "/model/anthropic.claude-3-5-haiku-20241022-v1%3A0/converse"
@@ -1769,7 +1812,7 @@ mod tests {
 
     #[test]
     fn canonical_uri_no_colon_unchanged() {
-        let uri = BedrockProvider::canonical_uri("anthropic.claude-sonnet-4-6");
+        let uri = BedrockModelProvider::canonical_uri("anthropic.claude-sonnet-4-6");
         assert_eq!(uri, "/model/anthropic.claude-sonnet-4-6/converse");
     }
 
@@ -1781,7 +1824,7 @@ mod tests {
             ChatMessage::system("You are helpful"),
             ChatMessage::user("Hello"),
         ];
-        let (system, msgs) = BedrockProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert!(system.is_some());
         let system_blocks = system.unwrap();
         assert_eq!(system_blocks.len(), 1);
@@ -1795,7 +1838,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there"),
         ];
-        let (system, msgs) = BedrockProvider::convert_messages(&messages);
+        let (system, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert!(system.is_none());
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "user");
@@ -1806,7 +1849,7 @@ mod tests {
     fn convert_messages_tool_role_to_tool_result() {
         let tool_json = r#"{"tool_call_id": "call_123", "content": "Result data"}"#;
         let messages = vec![ChatMessage::tool(tool_json)];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "user");
         assert!(matches!(msgs[0].content[0], ContentBlock::ToolResult(_)));
@@ -1816,7 +1859,7 @@ mod tests {
     fn convert_messages_assistant_tool_calls_parsed() {
         let tool_call_json = r#"{"content": "Let me check", "tool_calls": [{"id": "call_1", "name": "shell", "arguments": "{\"command\":\"ls\"}"}]}"#;
         let messages = vec![ChatMessage::assistant(tool_call_json)];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].role, "assistant");
         assert_eq!(msgs[0].content.len(), 2);
@@ -1827,7 +1870,7 @@ mod tests {
     #[test]
     fn convert_messages_plain_assistant_text() {
         let messages = vec![ChatMessage::assistant("Just text")];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         assert_eq!(msgs.len(), 1);
         assert!(matches!(msgs[0].content[0], ContentBlock::Text(_)));
     }
@@ -1836,19 +1879,21 @@ mod tests {
 
     #[test]
     fn should_cache_system_small_prompt() {
-        assert!(!BedrockProvider::should_cache_system("Short prompt"));
+        assert!(!BedrockModelProvider::should_cache_system("Short prompt"));
     }
 
     #[test]
     fn should_cache_system_large_prompt() {
         let large = "a".repeat(3073);
-        assert!(BedrockProvider::should_cache_system(&large));
+        assert!(BedrockModelProvider::should_cache_system(&large));
     }
 
     #[test]
     fn should_cache_system_boundary() {
-        assert!(!BedrockProvider::should_cache_system(&"a".repeat(3072)));
-        assert!(BedrockProvider::should_cache_system(&"a".repeat(3073)));
+        assert!(!BedrockModelProvider::should_cache_system(
+            &"a".repeat(3072)
+        ));
+        assert!(BedrockModelProvider::should_cache_system(&"a".repeat(3073)));
     }
 
     #[test]
@@ -1858,7 +1903,7 @@ mod tests {
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi"),
         ];
-        assert!(!BedrockProvider::should_cache_conversation(&messages));
+        assert!(!BedrockModelProvider::should_cache_conversation(&messages));
     }
 
     #[test]
@@ -1870,7 +1915,7 @@ mod tests {
                 content: format!("Message {i}"),
             });
         }
-        assert!(BedrockProvider::should_cache_conversation(&messages));
+        assert!(BedrockModelProvider::should_cache_conversation(&messages));
     }
 
     // ── Tool conversion tests ───────────────────────────────────
@@ -1882,7 +1927,7 @@ mod tests {
             description: "Run commands".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
         }];
-        let config = BedrockProvider::convert_tools_to_converse(Some(&tools));
+        let config = BedrockModelProvider::convert_tools_to_converse(Some(&tools));
         assert!(config.is_some());
         let config = config.unwrap();
         assert_eq!(config.tools.len(), 1);
@@ -1891,8 +1936,8 @@ mod tests {
 
     #[test]
     fn convert_tools_to_converse_empty_returns_none() {
-        assert!(BedrockProvider::convert_tools_to_converse(Some(&[])).is_none());
-        assert!(BedrockProvider::convert_tools_to_converse(None).is_none());
+        assert!(BedrockModelProvider::convert_tools_to_converse(Some(&[])).is_none());
+        assert!(BedrockModelProvider::convert_tools_to_converse(None).is_none());
     }
 
     // ── Serde tests ─────────────────────────────────────────────
@@ -1985,7 +2030,7 @@ mod tests {
             "stopReason": "end_turn"
         }"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let parsed = BedrockProvider::parse_converse_response(resp);
+        let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert_eq!(parsed.text.as_deref(), Some("Hello from Bedrock"));
         assert!(parsed.tool_calls.is_empty());
     }
@@ -2004,7 +2049,7 @@ mod tests {
             "stopReason": "tool_use"
         }"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let parsed = BedrockProvider::parse_converse_response(resp);
+        let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert!(parsed.text.is_none());
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].name, "shell");
@@ -2015,7 +2060,7 @@ mod tests {
     fn converse_response_empty_output() {
         let json = r#"{"output": null, "stopReason": null}"#;
         let resp: ConverseResponse = serde_json::from_str(json).unwrap();
-        let parsed = BedrockProvider::parse_converse_response(resp);
+        let parsed = BedrockModelProvider::parse_converse_response(resp);
         assert!(parsed.text.is_none());
         assert!(parsed.tool_calls.is_empty());
     }
@@ -2072,23 +2117,25 @@ mod tests {
 
     #[tokio::test]
     async fn warmup_without_credentials_is_noop() {
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         };
-        let result = provider.warmup().await;
+        let result = model_provider.warmup().await;
         assert!(result.is_ok());
     }
 
     #[test]
     fn capabilities_reports_native_tool_calling() {
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         };
-        let caps = provider.capabilities();
+        let caps = model_provider.capabilities();
         assert!(caps.native_tool_calling);
     }
 
@@ -2127,7 +2174,7 @@ mod tests {
                 content: "not valid json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         let tool_msg = &msgs[2];
         assert_eq!(tool_msg.role, "user");
         assert!(
@@ -2149,7 +2196,7 @@ mod tests {
                 content: "raw output with no json".to_string(),
             },
         ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         if let ContentBlock::ToolResult(ref wrapper) = msgs[2].content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "tool_abc");
             assert_eq!(wrapper.tool_result.status, "error");
@@ -2168,7 +2215,7 @@ mod tests {
             ChatMessage::tool(r#"{"tool_call_id":"t1","content":"result 1"}"#),
             ChatMessage::tool(r#"{"tool_call_id":"t2","content":"result 2"}"#),
         ];
-        let (_, msgs) = BedrockProvider::convert_messages(&messages);
+        let (_, msgs) = BedrockModelProvider::convert_messages(&messages);
         // Should be: user, assistant, user (merged tool results)
         assert_eq!(msgs.len(), 3, "Expected 3 messages, got {}", msgs.len());
         assert_eq!(msgs[2].role, "user");
@@ -2184,27 +2231,28 @@ mod tests {
     #[test]
     fn extract_tool_call_id_tries_multiple_field_names() {
         assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
+            BedrockModelProvider::extract_tool_call_id(r#"{"tool_call_id":"a"}"#),
             Some("a".to_string())
         );
         assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
+            BedrockModelProvider::extract_tool_call_id(r#"{"tool_use_id":"b"}"#),
             Some("b".to_string())
         );
         assert_eq!(
-            BedrockProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
+            BedrockModelProvider::extract_tool_call_id(r#"{"toolUseId":"c"}"#),
             Some("c".to_string())
         );
         assert_eq!(
-            BedrockProvider::extract_tool_call_id("not json at all"),
+            BedrockModelProvider::extract_tool_call_id("not json at all"),
             None
         );
     }
 
     #[test]
     fn parse_tool_result_accepts_alternate_id_fields() {
-        let msg =
-            BedrockProvider::parse_tool_result_message(r#"{"tool_use_id":"x","content":"ok"}"#);
+        let msg = BedrockModelProvider::parse_tool_result_message(
+            r#"{"tool_use_id":"x","content":"ok"}"#,
+        );
         assert!(msg.is_some());
         if let ContentBlock::ToolResult(ref wrapper) = msg.unwrap().content[0] {
             assert_eq!(wrapper.tool_result.tool_use_id, "x");
@@ -2221,7 +2269,7 @@ mod tests {
                 text: String::new(),
             })],
         }];
-        BedrockProvider::sanitize_empty_content_blocks(&mut messages);
+        BedrockModelProvider::sanitize_empty_content_blocks(&mut messages);
         assert_eq!(messages.len(), 1);
         if let ContentBlock::Text(ref tb) = messages[0].content[0] {
             assert_eq!(tb.text, "(empty)");
@@ -2238,7 +2286,7 @@ mod tests {
                 text: "Hello".to_string(),
             })],
         }];
-        BedrockProvider::sanitize_empty_content_blocks(&mut messages);
+        BedrockModelProvider::sanitize_empty_content_blocks(&mut messages);
         if let ContentBlock::Text(ref tb) = messages[0].content[0] {
             assert_eq!(tb.text, "Hello");
         } else {
@@ -2256,7 +2304,7 @@ mod tests {
             },
             ChatMessage::user("Continue"),
         ];
-        let (_, converse) = BedrockProvider::convert_messages(&messages);
+        let (_, converse) = BedrockModelProvider::convert_messages(&messages);
         let assistant_msg = &converse[1];
         assert_eq!(assistant_msg.role, "assistant");
         if let ContentBlock::Text(ref tb) = assistant_msg.content[0] {
@@ -2410,23 +2458,25 @@ region=ap-southeast-1
 
     #[test]
     fn cached_credentials_returns_none_when_empty() {
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         };
-        assert!(provider.cached_credentials().is_none());
+        assert!(model_provider.cached_credentials().is_none());
     }
 
     #[test]
     fn cached_credentials_returns_some_when_valid() {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(Some(make_creds(Some(future)))),
         };
-        let cached = provider.cached_credentials();
+        let cached = model_provider.cached_credentials();
         assert!(cached.is_some());
         assert_eq!(cached.unwrap().access_key_id, "AKIA");
     }
@@ -2434,24 +2484,26 @@ region=ap-southeast-1
     #[test]
     fn cached_credentials_returns_none_when_expired() {
         let past = chrono::Utc::now() - chrono::Duration::hours(1);
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(Some(make_creds(Some(past)))),
         };
-        assert!(provider.cached_credentials().is_none());
+        assert!(model_provider.cached_credentials().is_none());
     }
 
     #[test]
     fn cache_credentials_stores_and_retrieves() {
         let future = chrono::Utc::now() + chrono::Duration::hours(1);
-        let provider = BedrockProvider {
+        let model_provider = BedrockModelProvider {
+            alias: "test".to_string(),
             auth: None,
-            max_tokens: zeroclaw_api::provider::BASELINE_MAX_TOKENS,
+            max_tokens: zeroclaw_api::model_provider::BASELINE_MAX_TOKENS,
             cred_cache: Mutex::new(None),
         };
-        assert!(provider.cached_credentials().is_none());
-        provider.cache_credentials(&make_creds(Some(future)));
-        assert!(provider.cached_credentials().is_some());
+        assert!(model_provider.cached_credentials().is_none());
+        model_provider.cache_credentials(&make_creds(Some(future)));
+        assert!(model_provider.cached_credentials().is_some());
     }
 }

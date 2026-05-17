@@ -5,12 +5,25 @@ use async_trait::async_trait;
 ///
 /// This backend is used when `memory.backend = "none"` to disable persistence
 /// while keeping the runtime wiring stable.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NoneMemory;
+#[derive(Debug, Default, Clone)]
+pub struct NoneMemory {
+    alias: String,
+}
 
 impl NoneMemory {
-    pub fn new() -> Self {
-        Self
+    pub fn new(alias: &str) -> Self {
+        Self {
+            alias: alias.to_string(),
+        }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for NoneMemory {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Memory(::zeroclaw_api::attribution::MemoryKind::None)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -64,6 +77,31 @@ impl Memory for NoneMemory {
     async fn health_check(&self) -> bool {
         true
     }
+
+    async fn store_with_agent(
+        &self,
+        _key: &str,
+        _content: &str,
+        _category: MemoryCategory,
+        _session_id: Option<&str>,
+        _namespace: Option<&str>,
+        _importance: Option<f64>,
+        _agent_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn recall_for_agents(
+        &self,
+        _allowed_agent_ids: &[&str],
+        _query: &str,
+        _limit: usize,
+        _session_id: Option<&str>,
+        _since: Option<&str>,
+        _until: Option<&str>,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        Ok(Vec::new())
+    }
 }
 
 #[cfg(test)]
@@ -72,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn none_memory_is_noop() {
-        let memory = NoneMemory::new();
+        let memory = NoneMemory::new("none");
 
         memory
             .store("k", "v", MemoryCategory::Core, None)

@@ -77,8 +77,15 @@ impl EscalateToHumanTool {
                     if let Some(ch) = channels.get(name) {
                         Some((name.clone(), Arc::clone(ch)))
                     } else {
-                        tracing::warn!(
-                            "escalate_to_human: alert channel '{name}' not found in channel map"
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"name": name})),
+                            "escalate_to_human: alert channel '' not found in channel map"
                         );
                         None
                     }
@@ -88,7 +95,13 @@ impl EscalateToHumanTool {
         for (name, ch) in targets {
             let msg = SendMessage::new(text, "");
             if let Err(e) = ch.send(&msg).await {
-                tracing::warn!("escalate_to_human: alert to channel '{name}' failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string(), "name": name})),
+                    "escalate_to_human: alert to channel '' failed"
+                );
             }
         }
     }
@@ -311,6 +324,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for SilentChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for SilentChannel {
         fn name(&self) -> &str {
@@ -349,6 +373,17 @@ mod tests {
         }
     }
 
+    impl ::zeroclaw_api::attribution::Attributable for RespondingChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
     #[async_trait]
     impl Channel for RespondingChannel {
         fn name(&self) -> &str {
@@ -370,6 +405,7 @@ mod tests {
                 reply_target: "human".to_string(),
                 content: self.response.clone(),
                 channel: self.channel_name.clone(),
+                channel_alias: None,
                 timestamp: 1000,
                 thread_ts: None,
                 interruption_scope_id: None,
@@ -568,6 +604,17 @@ mod tests {
                 channel_name: name.to_string(),
                 sent: Arc::new(RwLock::new(Vec::new())),
             }
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for StructuredOnlyChannel {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Channel(
+                ::zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
         }
     }
 

@@ -189,13 +189,11 @@ mod allowlist {
     /// `@bot:example.org`. ASCII case-insensitive match is the conservative
     /// reading.
     pub(super) fn user_allowed(allowed_users: &[String], sender: &str) -> bool {
-        if allowed_users.is_empty() {
-            return false;
-        }
-        if allowed_users.iter().any(|u| u == "*") {
-            return true;
-        }
-        allowed_users.iter().any(|u| u.eq_ignore_ascii_case(sender))
+        crate::allowlist::is_user_allowed(
+            allowed_users,
+            sender,
+            crate::allowlist::Match::CaseInsensitive,
+        )
     }
 
     pub(super) fn room_allowed_static(allowed_rooms: &[String], room_id: &str) -> bool {
@@ -458,9 +456,14 @@ mod session {
         match serde_json::from_slice::<SessionBlob>(&bytes) {
             Ok(blob) => Ok(Some(blob)),
             Err(e) => {
-                tracing::warn!(
-                    "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
-                    p.display()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                    &format!(
+                        "matrix: session blob {} is corrupt JSON ({e}); treating as missing so auto-recovery can re-login",
+                        p.display()
+                    )
                 );
                 Ok(None)
             }
@@ -516,7 +519,6 @@ mod client {
     };
     use serde::Deserialize;
     use tokio::sync::RwLock;
-    use tracing::{debug, info, warn};
 
     use super::session;
     use zeroclaw_config::schema::MatrixConfig;
@@ -644,13 +646,18 @@ mod client {
             config.device_id.as_deref().filter(|s| !s.is_empty()),
         ) && want != blob.device_id
         {
-            warn!(
-                "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: configured channels.matrix.device-id ({want}) differs from the saved session ({}). \
                  Honoring the saved device_id (canonical, assigned by the homeserver). \
                  Update channels.matrix.device-id to match (or clear it) to silence this warning, \
                  or wipe {} entirely to register a different device.",
-                blob.device_id,
-                state_dir.display(),
+                    blob.device_id,
+                    state_dir.display()
+                )
             );
         }
 
@@ -698,7 +705,11 @@ mod client {
                 .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
                 .await
             {
-                Ok(()) => info!("matrix: restored session from session.json"),
+                Ok(()) => ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "matrix: restored session from session.json"
+                ),
                 Err(e) => {
                     // restore_session failed despite a matching device_id —
                     // the access token is probably revoked, or the saved
@@ -748,7 +759,13 @@ mod client {
             if let Some(blob) = session_blob_from(&client)
                 && let Err(e) = session::save(state_dir, &blob)
             {
-                warn!("matrix: failed to persist session.json: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "matrix: failed to persist session.json"
+                );
             }
         }
 
@@ -787,9 +804,14 @@ mod client {
         reason: &str,
     ) -> Result<Client> {
         if can_password_relogin(config) {
-            warn!(
-                "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
-                state_dir.display()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: {reason} Auto-recovering: wiping {} and re-authenticating with password.",
+                    state_dir.display()
+                )
             );
             wipe_state(state_dir)?;
             return Box::pin(build_attempt(config, state_dir, recovery_attempts + 1)).await;
@@ -811,7 +833,11 @@ mod client {
         if let Some(pw) = config.password.as_deref().filter(|s| !s.is_empty()) {
             return password_login(client, config, pw).await;
         }
-        if !config.access_token.is_empty() {
+        if config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.is_empty())
+        {
             return access_token_login(client, config).await;
         }
         bail!("matrix login requires either access_token or user_id+password")
@@ -833,7 +859,11 @@ mod client {
             login = login.device_id(d);
         }
         login.send().await.context("password login failed")?;
-        info!("matrix: logged in via password");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: logged in via password"
+        );
         Ok(())
     }
 
@@ -849,7 +879,10 @@ mod client {
                 device_id: device_id.into(),
             },
             tokens: SessionTokens {
-                access_token: config.access_token.clone(),
+                access_token: config
+                    .access_token
+                    .clone()
+                    .ok_or_else(|| anyhow!("matrix.access_token is required for token login"))?,
                 refresh_token: None,
             },
         };
@@ -858,7 +891,11 @@ mod client {
             .restore_session(session, matrix_sdk::store::RoomLoadSettings::default())
             .await
             .context("attach matrix session via access_token")?;
-        info!("matrix: logged in via access_token");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: logged in via access_token"
+        );
         Ok(())
     }
 
@@ -916,13 +953,17 @@ mod client {
     }
 
     async fn fetch_access_token_whoami(config: &MatrixConfig) -> Result<WhoamiResponse> {
+        let access_token = config
+            .access_token
+            .as_deref()
+            .context("matrix: whoami requires access_token")?;
         let url = matrix_client_api_url(&config.homeserver, WHOAMI_ENDPOINT)?;
         let response = reqwest::Client::builder()
             .timeout(WHOAMI_TIMEOUT)
             .build()
             .context("matrix: build whoami HTTP client")?
             .get(url)
-            .bearer_auth(&config.access_token)
+            .bearer_auth(access_token)
             .send()
             .await
             .context("matrix: whoami request failed")?;
@@ -1056,7 +1097,11 @@ mod client {
             recovery.state(),
             matrix_sdk::encryption::recovery::RecoveryState::Enabled
         ) {
-            debug!("matrix: recovery already enabled, skipping recover()");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                "matrix: recovery already enabled, skipping recover()"
+            );
             return;
         }
 
@@ -1065,13 +1110,18 @@ mod client {
 
         match recovery.recover(key).await {
             Ok(()) => {
-                info!("matrix: E2EE recovery completed (cross-signing + room keys imported)")
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    "matrix: E2EE recovery completed (cross-signing + room keys imported)"
+                )
             }
-            Err(e) => warn!(
-                "matrix: E2EE recovery failed: {e}; full error chain = {e:?}. \
-                 If the input length above is unexpected (base58 keys are typically \
-                 ~58 chars, passphrases vary), the wrong value may be in \
-                 channels.matrix.recovery-key."
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                "matrix: E2EE recovery failed: ; full error chain = . If the input length above is unexpected (base58 keys are typically ~58 chars, passphrases vary), the wrong value may be in channels.matrix.recovery-key."
             ),
         }
     }
@@ -1090,18 +1140,34 @@ mod client {
             Ok(Some(raw)) => match raw.deserialize() {
                 Ok(content) => Some(content),
                 Err(e) => {
-                    warn!("matrix: cannot deserialize default secret-storage key event: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "matrix: cannot deserialize default secret-storage key event"
+                    );
                     None
                 }
             },
             Ok(None) => {
-                warn!(
-                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len={input_len}). Set up Secure Backup in Element first."
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"input_len": input_len})),
+                    "matrix: server has no m.secret_storage.default_key set; recovery cannot proceed (input_len=). Set up Secure Backup in Element first."
                 );
                 return;
             }
             Err(e) => {
-                warn!("matrix: failed to fetch default secret-storage key event: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "matrix: failed to fetch default secret-storage key event"
+                );
                 return;
             }
         };
@@ -1119,25 +1185,41 @@ mod client {
                 let json = raw.json().get();
                 let has_passphrase =
                     json.contains("\"passphrase\"") && json.contains("\"iterations\"");
-                info!(
-                    "matrix: secret-storage diagnostics: default_key_id={key_id}, \
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                    &format!(
+                        "matrix: secret-storage diagnostics: default_key_id={key_id}, \
                      has_passphrase_info={has_passphrase}, input_len={input_len}. \
                      {}",
-                    if has_passphrase {
-                        "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
-                    } else {
-                        "SDK will use base58 decoding directly."
-                    }
+                        if has_passphrase {
+                            "SDK will try passphrase derivation first; if your input is a base58 key the passphrase MAC will fail and the error you see may be the passphrase error rather than the base58 fallback's error."
+                        } else {
+                            "SDK will use base58 decoding directly."
+                        }
+                    )
                 );
                 let _ = SecretStorageKeyEventContent::TYPE; // keep import live
             }
             Ok(None) => {
-                warn!(
-                    "matrix: default key id {key_id} has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"key_id": key_id})),
+                    "matrix: default key id has no corresponding key event on the account — secret storage is in an inconsistent state. Re-running Secure Backup setup in Element will repair this."
                 );
             }
             Err(e) => {
-                warn!("matrix: failed to fetch key event for {key_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": e.to_string(), "key_id": key_id})
+                        ),
+                    "matrix: failed to fetch key event for"
+                );
             }
         }
     }
@@ -1167,8 +1249,12 @@ mod client {
     ) -> Result<OwnedRoomId> {
         let (id_or_alias, normalized) = normalize_recipient(id_or_alias);
         if normalized {
-            warn!(
-                "matrix: recipient contains `||`; using {id_or_alias:?} as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"id_or_alias": id_or_alias})),
+                "matrix: recipient contains `||`; using as the room target. Update channels.matrix or cron `delivery.to` to a plain room id/alias to silence this warning."
             );
         }
         if id_or_alias.starts_with('!') {
@@ -1228,7 +1314,6 @@ mod inbound {
     };
     use serde_json::Value as JsonValue;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock, mpsc, oneshot};
-    use tracing::{debug, error, info, warn};
 
     use super::{allowlist, approval, context as ctx_mod, mention};
     use crate::transcription::TranscriptionManager;
@@ -1241,6 +1326,12 @@ mod inbound {
     #[derive(Clone)]
     pub(super) struct HandlerCtx {
         pub config: Arc<MatrixConfig>,
+        /// ZeroClaw alias for `[channels.matrix.<alias>]` so session_key
+        /// construction can scope by bot instance.
+        pub alias: String,
+        /// Resolves inbound external peers from canonical state at message-time.
+        /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+        pub peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         pub transcription: Option<Arc<TranscriptionConfig>>,
         pub workspace_dir: Option<Arc<std::path::PathBuf>>,
         pub tx: mpsc::Sender<ChannelMessage>,
@@ -1274,7 +1365,16 @@ mod inbound {
                 let ctx = handler_ctx.clone();
                 async move {
                     if let Err(e) = handle_message(ctx, ev, room, raw).await {
-                        warn!("matrix: handle_message failed: {e}");
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "matrix: handle_message failed"
+                        );
                     }
                 }
             },
@@ -1295,7 +1395,11 @@ mod inbound {
             });
         let _encrypted_handler_guard = client.event_handler_drop_guard(encrypted_handler);
 
-        info!("matrix: starting sync loop");
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "matrix: starting sync loop"
+        );
         // Run an initial sync once so the sync token + state are populated,
         // then flip the health flag and enter the long-running sync loop.
         if let Err(e) = client.sync_once(SyncSettings::default()).await {
@@ -1327,14 +1431,26 @@ mod inbound {
         if already {
             return;
         }
-        debug!(
-            "matrix: reacting ❓ to undecryptable event {} from {}",
-            event_id, ev.sender
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "matrix: reacting ❓ to undecryptable event {} from {}",
+                event_id, ev.sender
+            )
         );
         let content =
             ReactionEventContent::new(Annotation::new(event_id.clone(), "❓".to_string()));
         if let Err(e) = room.send(content).await {
-            warn!("matrix: failed to react ❓ on undecryptable event {event_id}: {e}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"error": e.to_string(), "event_id": event_id})
+                    ),
+                "matrix: failed to react ❓ on undecryptable event"
+            );
         }
     }
 
@@ -1365,12 +1481,23 @@ mod inbound {
             }
         }
 
-        if !allowlist::user_allowed(&ctx.config.allowed_users, sender) {
-            debug!("matrix: drop message from non-allowed sender {sender}");
+        let allowed_peers = (ctx.peer_resolver)();
+        if !allowlist::user_allowed(&allowed_peers, sender) {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"sender": sender})),
+                "matrix: drop message from non-allowed sender"
+            );
             return Ok(());
         }
         if !allowlist::room_allowed_static(&ctx.config.allowed_rooms, room_id) {
-            debug!("matrix: drop message from non-allowed room {room_id}");
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"room_id": room_id})),
+                "matrix: drop message from non-allowed room"
+            );
             return Ok(());
         }
 
@@ -1383,7 +1510,12 @@ mod inbound {
                 mention_user_ids.as_deref(),
                 &body,
             ) {
-                debug!("matrix: drop unmentioned message from {sender}");
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"sender": sender})),
+                    "matrix: drop unmentioned message from"
+                );
                 return Ok(());
             }
         }
@@ -1405,7 +1537,13 @@ mod inbound {
                         );
                     }
                 }
-                Err(e) => warn!("matrix: failed to fetch thread root {tid}: {e}"),
+                Err(e) => ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string(), "tid": tid})),
+                    "matrix: failed to fetch thread root"
+                ),
             }
         }
 
@@ -1482,10 +1620,22 @@ mod inbound {
                         .await;
                     }
                 }
-                Err(e) => debug!("matrix: could not fetch in_reply_to parent {reply_target}: {e}"),
+                Err(e) => {
+                    ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"error": e.to_string(), "reply_target": reply_target})), "matrix: could not fetch in_reply_to parent")
+                }
             }
         }
         let attachments: Vec<MediaAttachment> = Vec::new();
+
+        let outbound_anchor =
+            resolve_outbound_anchor(thread_id.as_ref(), &ev.event_id, ctx.config.reply_in_thread);
+        // When the bot is the one starting the thread, mark its root seen
+        // so the next inbound that lands inside it does not re-fetch and
+        // re-inject a root preamble (the agent already saw the root in this
+        // same turn).
+        if thread_id.is_none() && ctx.config.reply_in_thread {
+            ctx_mod::mark_seen(&ctx.threads_seen, ev.event_id.clone()).await;
+        }
 
         let msg = ChannelMessage {
             id: ev.event_id.to_string(),
@@ -1493,28 +1643,24 @@ mod inbound {
             reply_target: room.room_id().to_string(),
             content,
             channel: "matrix".to_string(),
+            channel_alias: Some(ctx.alias.clone()),
             timestamp: SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
-            // Reply anchor: use the existing thread root when present,
-            // otherwise (when reply_in_thread is on) anchor a brand-new thread
-            // on this very event so the bot's reply opens a thread.
-            thread_ts: thread_id.as_ref().map(|t| t.to_string()).or_else(|| {
-                if ctx.config.reply_in_thread {
-                    Some(ev.event_id.to_string())
-                } else {
-                    None
-                }
-            }),
-            // Interruption scope is for cancellation grouping — only set when
-            // the inbound is genuinely *inside* a reply thread.
-            interruption_scope_id: thread_id.as_ref().map(|t| t.to_string()),
+            thread_ts: outbound_anchor.clone(),
+            interruption_scope_id: outbound_anchor,
             attachments,
         };
 
         if let Err(e) = ctx.tx.send(msg).await {
-            error!("matrix: failed to forward inbound message: {e}");
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "matrix: failed to forward inbound message"
+            );
         }
         Ok(())
     }
@@ -1532,6 +1678,27 @@ mod inbound {
                 .filter_map(|x| x.as_str().map(|s| s.to_string()))
                 .collect(),
         )
+    }
+
+    /// Decide where the bot should anchor its reply. Carries the existing
+    /// thread root when the inbound is already inside an `m.thread`
+    /// relation. When the inbound is a root timeline event and
+    /// `reply_in_thread` is enabled, anchors a brand-new thread on the
+    /// inbound event itself so the bot's reply opens a thread the user
+    /// can continue the conversation in (matches the schema doc for
+    /// `[channels.matrix.<alias>].reply_in_thread`).
+    pub(super) fn resolve_outbound_anchor(
+        thread_id: Option<&OwnedEventId>,
+        event_id: &OwnedEventId,
+        reply_in_thread: bool,
+    ) -> Option<String> {
+        thread_id.map(ToString::to_string).or_else(|| {
+            if reply_in_thread {
+                Some(event_id.to_string())
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn extract_thread_id(raw: &RawEvent) -> Option<OwnedEventId> {
@@ -1645,12 +1812,27 @@ mod inbound {
                             content = format!("[voice transcript]: {text}\n\n{content}");
                         }
                         Ok(_) => {}
-                        Err(e) => warn!("matrix: voice transcription failed: {e}"),
+                        Err(e) => ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                            "matrix: voice transcription failed"
+                        ),
                     }
                 }
             }
             Ok(None) => {}
-            Err(e) => warn!("matrix: media handling failed: {e}"),
+            Err(e) => ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                "matrix: media handling failed"
+            ),
         }
         content
     }
@@ -1729,9 +1911,14 @@ mod inbound {
         workspace: Option<&std::path::PathBuf>,
     ) -> anyhow::Result<Option<std::path::PathBuf>> {
         let Some(workspace) = workspace else {
-            warn!(
-                "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set ZEROCLAW_DIR or run via the orchestrator.",
-                info.file_name
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "matrix: cannot persist {} — channels.matrix workspace_dir not configured. Set ZEROCLAW_DIR or run via the orchestrator.",
+                    info.file_name
+                )
             );
             return Ok(None);
         };
@@ -1759,11 +1946,15 @@ mod inbound {
         let path = dir.join(unique);
         std::fs::write(&path, &bytes)
             .map_err(|e| anyhow::anyhow!("write {}: {e}", path.display()))?;
-        info!(
-            "matrix: saved {} bytes ({}) to {}",
-            bytes.len(),
-            source_kind,
-            path.display()
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "matrix: saved {} bytes ({}) to {}",
+                bytes.len(),
+                source_kind,
+                path.display()
+            )
         );
         Ok(Some(path))
     }
@@ -1849,13 +2040,16 @@ mod outbound {
     use futures_util::StreamExt;
     use matrix_sdk::{
         Client, Room, RoomState,
-        attachment::AttachmentConfig,
+        attachment::{
+            AttachmentConfig, AttachmentInfo, BaseAudioInfo, BaseFileInfo, BaseImageInfo,
+            BaseVideoInfo,
+        },
         room::{
             edit::EditedContent,
             reply::{EnforceThread, Reply},
         },
         ruma::{
-            OwnedEventId, OwnedRoomId,
+            OwnedEventId, OwnedRoomId, UInt,
             events::{
                 reaction::ReactionEventContent,
                 relation::Annotation,
@@ -1871,7 +2065,6 @@ mod outbound {
     use std::sync::OnceLock;
     use std::time::Duration;
     use tokio::sync::{Mutex as TokioMutex, RwLock as TokioRwLock};
-    use tracing::warn;
 
     use super::{client, context as ctx_mod, markers};
     use zeroclaw_api::{channel::SendMessage, media::MediaAttachment};
@@ -2186,9 +2379,14 @@ mod outbound {
                         MarkerFailure::Refused => "trust boundary",
                         MarkerFailure::Failed => "not found",
                     };
-                    warn!(
-                        "matrix: skipping outbound marker for {} ({label}): {e}",
-                        marker.target
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} ({label}): {e}",
+                            marker.target
+                        )
                     );
                     failed_markers.push((marker.target.clone(), kind));
                     continue;
@@ -2198,9 +2396,17 @@ mod outbound {
                 MarkerTarget::Local(path) => match tokio::fs::read(&path).await {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!(
-                            "matrix: skipping outbound marker for {} (read failed): {e}",
-                            marker.target
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (read failed): {e}",
+                                marker.target
+                            )
                         );
                         failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                         continue;
@@ -2209,9 +2415,17 @@ mod outbound {
                 MarkerTarget::Http(url) => match fetch_http(url).await {
                     Ok(b) => b,
                     Err(e) => {
-                        warn!(
-                            "matrix: skipping outbound marker for {} (http failed): {e}",
-                            marker.target
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Note
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                            &format!(
+                                "matrix: skipping outbound marker for {} (http failed): {e}",
+                                marker.target
+                            )
                         );
                         failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                         continue;
@@ -2228,9 +2442,14 @@ mod outbound {
             match upload_attachment(room, &att, kind, thread_anchor).await {
                 Ok(id) => last_attachment_id = Some(id),
                 Err(e) => {
-                    warn!(
-                        "matrix: skipping outbound marker for {} (upload failed): {e}",
-                        marker.target
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                        &format!(
+                            "matrix: skipping outbound marker for {} (upload failed): {e}",
+                            marker.target
+                        )
                     );
                     failed_markers.push((marker.target.clone(), MarkerFailure::Failed));
                 }
@@ -2336,7 +2555,13 @@ mod outbound {
             let content =
                 ReactionEventContent::new(Annotation::new(event_id.clone(), emoji.to_string()));
             if let Err(e) = room.send(content).await {
-                warn!("matrix: failed to send {emoji} reaction on outgoing message: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string(), "emoji": emoji})),
+                    "matrix: failed to send reaction on outgoing message"
+                );
             }
         }
     }
@@ -2455,7 +2680,8 @@ mod outbound {
         Ok(room)
     }
 
-    enum AttachmentKind {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) enum AttachmentKind {
         Auto,
         Image,
         Audio,
@@ -2470,18 +2696,25 @@ mod outbound {
         kind: AttachmentKind,
         thread_anchor: Option<&OwnedEventId>,
     ) -> Result<OwnedEventId> {
-        let mime: mime_guess::Mime = match att.mime_type.as_deref() {
-            Some(m) => m
-                .parse()
-                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-            None => mime_guess::from_path(&att.file_name)
-                .first()
-                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
-        };
+        let mime = attachment_mime(att);
         if matches!(kind, AttachmentKind::Voice) {
             return upload_voice(room, att, &mime, thread_anchor).await;
         }
-        let mut config = AttachmentConfig::new();
+        let config = attachment_config_for(att, kind, &mime, thread_anchor);
+        let resp = room
+            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
+            .await
+            .map_err(|e| anyhow!("send_attachment failed: {e}"))?;
+        Ok(resp.event_id)
+    }
+
+    pub(super) fn attachment_config_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+        thread_anchor: Option<&OwnedEventId>,
+    ) -> AttachmentConfig {
+        let mut config = AttachmentConfig::new().info(attachment_info_for(att, kind, mime));
         if let Some(anchor) = thread_anchor {
             config = config.reply(Some(Reply {
                 event_id: anchor.clone(),
@@ -2489,11 +2722,59 @@ mod outbound {
                 add_mentions: AddMentions::No,
             }));
         }
-        let resp = room
-            .send_attachment(att.file_name.clone(), &mime, att.data.clone(), config)
-            .await
-            .map_err(|e| anyhow!("send_attachment failed: {e}"))?;
-        Ok(resp.event_id)
+        config
+    }
+
+    pub(super) fn attachment_mime(att: &MediaAttachment) -> mime_guess::Mime {
+        match att.mime_type.as_deref() {
+            Some(m) => m
+                .parse()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+            None => mime_guess::from_path(&att.file_name)
+                .first()
+                .unwrap_or(mime_guess::mime::APPLICATION_OCTET_STREAM),
+        }
+    }
+
+    fn attachment_info_for(
+        att: &MediaAttachment,
+        kind: AttachmentKind,
+        mime: &mime_guess::Mime,
+    ) -> AttachmentInfo {
+        let size = UInt::try_from(att.data.len()).ok();
+        match attachment_info_kind(kind, mime) {
+            AttachmentKind::Image => AttachmentInfo::Image(BaseImageInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Audio => AttachmentInfo::Audio(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Video => AttachmentInfo::Video(BaseVideoInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::Voice => AttachmentInfo::Voice(BaseAudioInfo {
+                size,
+                ..Default::default()
+            }),
+            AttachmentKind::File | AttachmentKind::Auto => {
+                AttachmentInfo::File(BaseFileInfo { size })
+            }
+        }
+    }
+
+    fn attachment_info_kind(kind: AttachmentKind, mime: &mime_guess::Mime) -> AttachmentKind {
+        if kind == AttachmentKind::Voice {
+            return AttachmentKind::Voice;
+        }
+        match mime.type_() {
+            mime_guess::mime::IMAGE => AttachmentKind::Image,
+            mime_guess::mime::AUDIO => AttachmentKind::Audio,
+            mime_guess::mime::VIDEO => AttachmentKind::Video,
+            _ => AttachmentKind::File,
+        }
     }
 
     /// Voice messages need the `org.matrix.msc3245.voice` flag, which the
@@ -2568,6 +2849,12 @@ mod outbound {
 /// Matrix channel.
 pub struct MatrixChannel {
     config: Arc<MatrixConfig>,
+    /// The alias key under `[channels.matrix.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     state_dir: PathBuf,
     workspace_dir: Option<Arc<PathBuf>>,
     transcription: Option<Arc<TranscriptionConfig>>,
@@ -2580,20 +2867,46 @@ pub struct MatrixChannel {
     bot_display_name: Arc<TokioRwLock<Option<String>>>,
     initial_sync_done: Arc<AtomicBool>,
     undecryptable_seen: Arc<TokioMutex<HashSet<OwnedEventId>>>,
+    /// Resolved `ack_reactions` for this Matrix instance — the
+    /// per-channel `MatrixConfig.ack_reactions` override falls back to
+    /// `[channels].ack_reactions` here at construction time, so the
+    /// read site doesn't need to re-resolve on every reaction.
+    ack_reactions: bool,
 }
 
 impl MatrixChannel {
     /// Validate config and prepare the channel. The SDK Client is built lazily
     /// on first `listen()` or `send()` call.
-    pub fn new(config: MatrixConfig, state_dir: PathBuf) -> Result<Self> {
+    pub fn new(
+        config: MatrixConfig,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        state_dir: PathBuf,
+    ) -> Result<Self> {
         if config.homeserver.trim().is_empty() {
             bail!("matrix: `homeserver` is required");
         }
-        if config.access_token.trim().is_empty() && config.password.is_none() {
+        let has_token = config
+            .access_token
+            .as_deref()
+            .is_some_and(|t| !t.trim().is_empty());
+        let has_password = config
+            .password
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty());
+        if !has_token && !has_password {
             bail!("matrix: configure either `access_token` or `password`");
         }
+        // Initial resolved value: when the per-channel override is set
+        // we honor it directly; when it's `None`, default to `true`
+        // (the channels-wide default). Orchestrator callers should chain
+        // `.with_ack_reactions(...)` after construction to thread the
+        // actual `[channels].ack_reactions` global through.
+        let ack_reactions = config.ack_reactions.unwrap_or(true);
         Ok(Self {
             config: Arc::new(config),
+            alias: alias.into(),
+            peer_resolver,
             state_dir,
             workspace_dir: None,
             transcription: None,
@@ -2606,7 +2919,25 @@ impl MatrixChannel {
             bot_display_name: Arc::new(TokioRwLock::new(None)),
             initial_sync_done: Arc::new(AtomicBool::new(false)),
             undecryptable_seen: Arc::new(TokioMutex::new(HashSet::new())),
+            ack_reactions,
         })
+    }
+
+    /// Return the alias under `[channels.matrix.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Override the resolved `ack_reactions` value for this Matrix
+    /// channel. Used by the orchestrator to push the channels-wide
+    /// default down after constructing from per-channel config; the
+    /// orchestrator computes `mx.ack_reactions.unwrap_or(config.channels.ack_reactions)`
+    /// and passes the resolved bool here.
+    #[must_use]
+    pub fn with_ack_reactions(mut self, ack_reactions: bool) -> Self {
+        self.ack_reactions = ack_reactions;
+        self
     }
 
     pub fn with_transcription(mut self, transcription: TranscriptionConfig) -> Self {
@@ -2705,13 +3036,28 @@ impl MatrixChannel {
                 let mut msg = SendMessage::new(paragraph, recipient);
                 msg.thread_ts = thread_anchor.as_ref().map(|e| e.to_string());
                 if let Err(e) = outbound::send(&self.outbox(client), &msg).await {
-                    tracing::warn!("matrix: multi-message paragraph send failed: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "matrix: multi-message paragraph send failed"
+                    );
                 }
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
                 }
             }
         }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MatrixChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(::zeroclaw_api::attribution::ChannelKind::Matrix)
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -2735,6 +3081,8 @@ impl Channel for MatrixChannel {
             .to_owned();
         let ctx = inbound::HandlerCtx {
             config: self.config.clone(),
+            alias: self.alias.clone(),
+            peer_resolver: self.peer_resolver.clone(),
             transcription: self.transcription.clone(),
             workspace_dir: self.workspace_dir.clone(),
             tx,
@@ -2888,8 +3236,17 @@ impl Channel for MatrixChannel {
                                 outbound::edit(client, recipient, &draft.event_id, &delivery.text)
                                     .await
                             {
-                                tracing::warn!(
-                                    "matrix: partial finalize edit failed: {edit_err}; sending cleaned text fallback"
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(
+                                        ::serde_json::json!({"edit_err": edit_err.to_string()})
+                                    ),
+                                    "matrix: partial finalize edit failed: ; sending cleaned text fallback"
                                 );
                                 let mut fallback = SendMessage::new(&delivery.text, recipient);
                                 fallback.thread_ts =
@@ -2904,9 +3261,7 @@ impl Channel for MatrixChannel {
                                         .await;
                                     }
                                     Err(send_err) if any_attachment_landed => {
-                                        tracing::warn!(
-                                            "matrix: partial finalize cleaned text fallback failed after attachment upload: {send_err}; suppressing error to avoid duplicate attachment retry"
-                                        );
+                                        ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"send_err": send_err.to_string()})), "matrix: partial finalize cleaned text fallback failed after attachment upload: ; suppressing error to avoid duplicate attachment retry");
                                     }
                                     Err(send_err) => {
                                         return Err(edit_err).with_context(|| {
@@ -2930,8 +3285,15 @@ impl Channel for MatrixChannel {
                             )
                             .await
                             {
-                                tracing::warn!(
-                                    "matrix: partial finalize redaction failed after attachment-only upload: {err}; leaving placeholder to avoid duplicate attachment retry"
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Note
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"err": err.to_string()})),
+                                    "matrix: partial finalize redaction failed after attachment-only upload: ; leaving placeholder to avoid duplicate attachment retry"
                                 );
                             }
                         }
@@ -2994,7 +3356,7 @@ impl Channel for MatrixChannel {
     }
 
     async fn add_reaction(&self, channel_id: &str, message_id: &str, emoji: &str) -> Result<()> {
-        if !self.config.ack_reactions {
+        if !self.ack_reactions {
             return Ok(());
         }
         let client = self.ensure_client().await?;
@@ -3561,10 +3923,9 @@ mod tests {
             MatrixConfig {
                 enabled: true,
                 homeserver: "https://m.org".into(),
-                access_token: String::new(),
+                access_token: None,
                 user_id: user_id.map(String::from),
                 device_id: None,
-                allowed_users: vec![],
                 allowed_rooms: vec![],
                 interrupt_on_new_message: false,
                 stream_mode: Default::default(),
@@ -3575,14 +3936,15 @@ mod tests {
                 password: password.map(String::from),
                 approval_timeout_secs: 300,
                 reply_in_thread: true,
-                ack_reactions: true,
+                ack_reactions: Some(true),
+                excluded_tools: vec![],
             }
         }
 
         fn access_token_cfg(homeserver: String) -> MatrixConfig {
             MatrixConfig {
                 homeserver,
-                access_token: "secret-token".into(),
+                access_token: Some("secret-token".into()),
                 ..cfg(None, None)
             }
         }
@@ -3788,7 +4150,9 @@ mod tests {
     }
 
     mod thread_extraction {
-        use super::super::inbound::{extract_mentions_user_ids, extract_thread_id};
+        use super::super::inbound::{
+            extract_mentions_user_ids, extract_thread_id, resolve_outbound_anchor,
+        };
         use matrix_sdk::event_handler::RawEvent;
         use matrix_sdk::ruma::serde::Raw;
 
@@ -3831,6 +4195,35 @@ mod tests {
                 }
             }));
             assert!(extract_thread_id(&r).is_none());
+        }
+
+        #[test]
+        fn root_inbound_starts_new_thread_when_reply_in_thread_enabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(
+                resolve_outbound_anchor(None, &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+        }
+
+        #[test]
+        fn root_inbound_stays_root_when_reply_in_thread_disabled() {
+            let event_id = "$root:server".parse().expect("event id");
+            assert_eq!(resolve_outbound_anchor(None, &event_id, false), None);
+        }
+
+        #[test]
+        fn threaded_inbound_keeps_existing_thread_root() {
+            let event_id = "$reply:server".parse().expect("event id");
+            let thread_root = "$root:server".parse().expect("thread id");
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, true).as_deref(),
+                Some("$root:server")
+            );
+            assert_eq!(
+                resolve_outbound_anchor(Some(&thread_root), &event_id, false).as_deref(),
+                Some("$root:server")
+            );
         }
 
         #[test]
@@ -4385,6 +4778,110 @@ mod tests {
         fn empty_text_without_attachment_is_error() {
             // True empty-message case: nothing to deliver, surface the error.
             assert_eq!(decide_send_outcome(true, false), SendOutcome::EmptyError);
+        }
+    }
+
+    mod outbound_attachment_info {
+        use super::super::outbound::{AttachmentKind, attachment_config_for};
+        use matrix_sdk::{attachment::AttachmentInfo, ruma::UInt};
+        use zeroclaw_api::media::MediaAttachment;
+
+        fn attachment(file_name: &str, mime_type: &str, len: usize) -> MediaAttachment {
+            MediaAttachment {
+                file_name: file_name.to_string(),
+                data: vec![0; len],
+                mime_type: Some(mime_type.to_string()),
+            }
+        }
+
+        fn info_size(info: AttachmentInfo) -> Option<UInt> {
+            match info {
+                AttachmentInfo::Image(info) => info.size,
+                AttachmentInfo::Video(info) => info.size,
+                AttachmentInfo::Audio(info) | AttachmentInfo::Voice(info) => info.size,
+                AttachmentInfo::File(info) => info.size,
+            }
+        }
+
+        #[test]
+        fn structured_file_attachment_carries_matrix_size_info() {
+            let att = attachment("report.pdf", "application/pdf", 4096);
+
+            let mime = super::super::outbound::attachment_mime(&att);
+            let config = attachment_config_for(&att, AttachmentKind::Auto, &mime, None);
+
+            let info = config.info.expect("attachment info is populated");
+            assert!(matches!(info, AttachmentInfo::File(_)));
+            assert_eq!(info_size(info), UInt::try_from(4096usize).ok());
+        }
+
+        #[test]
+        fn media_markers_use_type_specific_matrix_info_with_size() {
+            let cases = [
+                (
+                    AttachmentKind::Image,
+                    attachment("photo.png", "image/png", 17),
+                    "image",
+                ),
+                (
+                    AttachmentKind::Audio,
+                    attachment("clip.ogg", "audio/ogg", 23),
+                    "audio",
+                ),
+                (
+                    AttachmentKind::Video,
+                    attachment("movie.mp4", "video/mp4", 31),
+                    "video",
+                ),
+            ];
+
+            for (kind, att, expected_kind) in cases {
+                let mime = super::super::outbound::attachment_mime(&att);
+                let config = attachment_config_for(&att, kind, &mime, None);
+                let info = config.info.expect("attachment info is populated");
+                match (&info, expected_kind) {
+                    (AttachmentInfo::Image(_), "image") => {}
+                    (AttachmentInfo::Audio(_), "audio") => {}
+                    (AttachmentInfo::Video(_), "video") => {}
+                    _ => panic!("unexpected attachment info kind {info:?}"),
+                }
+                assert_eq!(info_size(info), UInt::try_from(att.data.len()).ok());
+            }
+        }
+
+        #[test]
+        fn attachment_info_kind_matches_final_mime_type() {
+            let image_named_as_file = attachment("photo.png", "image/png", 47);
+            let mime = super::super::outbound::attachment_mime(&image_named_as_file);
+            let config =
+                attachment_config_for(&image_named_as_file, AttachmentKind::File, &mime, None);
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::Image(_)),
+                "info must match the MIME-selected Matrix event type"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_named_as_file.data.len()).ok()
+            );
+
+            let image_marker_with_file_mime = attachment("report.pdf", "application/pdf", 53);
+            let mime = super::super::outbound::attachment_mime(&image_marker_with_file_mime);
+            let config = attachment_config_for(
+                &image_marker_with_file_mime,
+                AttachmentKind::Image,
+                &mime,
+                None,
+            );
+            let info = config.info.expect("attachment info is populated");
+            assert!(
+                matches!(info, AttachmentInfo::File(_)),
+                "file MIME should use file info so SDK preserves size"
+            );
+            assert_eq!(
+                info_size(info),
+                UInt::try_from(image_marker_with_file_mime.data.len()).ok()
+            );
         }
     }
 }

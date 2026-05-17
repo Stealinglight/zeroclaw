@@ -121,7 +121,12 @@ impl HttpRequestTool {
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let timeout_secs = if self.timeout_secs == 0 {
-            tracing::warn!("http_request: timeout_secs is 0, using safe default of 30s");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "http_request: timeout_secs is 0, using safe default of 30s"
+            );
             30
         } else {
             self.timeout_secs
@@ -221,13 +226,8 @@ impl Tool for HttpRequestTool {
             });
         }
 
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
+        // Rate limiting is applied by the RateLimitedTool wrapper at
+        // registration time (see zeroclaw-runtime::tools::mod).
 
         let url = match self.validate_url(url) {
             Ok(v) => v,
@@ -709,21 +709,6 @@ mod tests {
             .unwrap();
         assert!(!result.success);
         assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_when_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
-        let result = tool
-            .execute(json!({"url": "https://example.com"}))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("rate limit"));
     }
 
     #[test]

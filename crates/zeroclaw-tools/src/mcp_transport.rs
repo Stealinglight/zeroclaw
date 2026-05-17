@@ -168,7 +168,9 @@ impl McpTransportConn for StdioTransport {
             if resp.id.is_none() {
                 // Server-sent notification (e.g. `notifications/initialized`) — skip and
                 // keep waiting for the actual response to our request.
-                tracing::debug!(
+                ::zeroclaw_log::record!(
+                    DEBUG,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
                     "MCP stdio: skipping server notification while waiting for response"
                 );
                 continue;
@@ -512,26 +514,6 @@ impl SseTransport {
         }
         Ok((derived, false))
     }
-
-    #[allow(dead_code)] // WIP: alternate message URL fallback
-    fn maybe_try_alternate_message_url(
-        &self,
-        current_url: &str,
-        from_endpoint: bool,
-    ) -> Option<String> {
-        if from_endpoint {
-            return None;
-        }
-        let alt = if current_url.ends_with("/messages") {
-            derive_message_url(&self.sse_url, "message")
-        } else {
-            derive_message_url(&self.sse_url, "messages")
-        }?;
-        if alt == current_url {
-            return None;
-        }
-        Some(alt)
-    }
 }
 
 #[derive(Default)]
@@ -616,10 +598,13 @@ async fn handle_sse_event(
     if let Some(tx) = tx {
         let _ = tx.send(resp);
     } else {
-        tracing::debug!(
-            "MCP SSE `{}` received response for unknown id {}",
-            server_name,
-            id
+        ::zeroclaw_log::record!(
+            DEBUG,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!(
+                "MCP SSE `{}` received response for unknown id {}",
+                server_name, id
+            )
         );
     }
 }

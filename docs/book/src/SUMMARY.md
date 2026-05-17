@@ -22,11 +22,14 @@
 - [Overview](./architecture/overview.md)
 - [Request lifecycle](./architecture/request-lifecycle.md)
 - [Crates](./architecture/crates.md)
+- [Logging](./architecture/logging.md)
+- [Multi-agent runtime](./architecture/multi-agent.md)
 
 # Reference
 
 - [CLI](./reference/cli.md)
 - [Config](./reference/config.md)
+- [Environment variables](./reference/env-vars.md)
 - [API (rustdoc)](./api.md)
 - [Gateway HTTP API](./gateway/api.md)
 
@@ -72,6 +75,7 @@
 - [Overview](./ops/overview.md)
 - [Service & daemon](./ops/service.md)
 - [Logs & observability](./ops/observability.md)
+- [Cost tracking](./ops/cost-tracking.md)
 - [Troubleshooting](./ops/troubleshooting.md)
 - [Network deployment](./ops/network-deployment.md)
 
@@ -119,6 +123,7 @@
 - [Privacy & PII discipline](./contributing/privacy.md)
 - [Testing](./contributing/testing.md)
 - [PR review protocol](./contributing/pr-review-protocol.md)
+- [Multi-agent setup](./contributing/multi-agent-setup.md)
 - [Contributor License Agreement](./contributing/cla.md)
 
 # Maintainers

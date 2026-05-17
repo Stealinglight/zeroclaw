@@ -10,7 +10,7 @@
 //!
 //! Cached behind a `OnceCell` because the spec is static per build.
 //!
-//! See #6175.
+//!
 
 use axum::{
     http::{HeaderValue, StatusCode, header},
@@ -63,14 +63,7 @@ pub async fn handle_openapi_json() -> Response {
 pub fn build_spec() -> serde_json::Value {
     use crate::api_config::{
         DriftEntry, DriftResponse, InitQuery, InitResponse, ListResponse, MigrateResponse, PatchOp,
-        PatchResponse, PropPutBody, PropResponse, SecretResponse,
-    };
-    use crate::api_providers::{ProviderInfo, ProviderListResponse};
-    use crate::api_slots::{SlotApproveRequest, SlotMessageRequest};
-    use crate::persona::{PersonaError, PersonaListResponse, PersonaPreset};
-    use crate::slot::{
-        Slot, SlotAgentConfig, SlotCreateRequest, SlotDuplicateRequest, SlotError,
-        SlotListResponse, SlotMode, SlotPatchRequest, SlotResponse, SlotState, SlotUpdate,
+        PatchResponse, PropPutBody, PropResponse, ReloadStatusResponse, SecretResponse,
     };
     use zeroclaw_config::api_error::ConfigApiError;
 
@@ -80,37 +73,20 @@ pub fn build_spec() -> serde_json::Value {
 
     let components = serde_json::json!({
         "schemas": {
-            "ConfigApiError":       schema_value::<ConfigApiError>(),
-            "PropPutBody":          schema_value::<PropPutBody>(),
-            "PropResponse":         schema_value::<PropResponse>(),
-            "SecretResponse":       schema_value::<SecretResponse>(),
-            "ListResponse":         schema_value::<ListResponse>(),
-            "PatchOp":              schema_value::<PatchOp>(),
-            "PatchResponse":        schema_value::<PatchResponse>(),
-            "InitQuery":            schema_value::<InitQuery>(),
-            "InitResponse":         schema_value::<InitResponse>(),
-            "MigrateResponse":      schema_value::<MigrateResponse>(),
-            "DriftEntry":           schema_value::<DriftEntry>(),
-            "DriftResponse":        schema_value::<DriftResponse>(),
-            "Config":               schema_value::<zeroclaw_config::schema::Config>(),
-            "Slot":                 schema_value::<Slot>(),
-            "SlotAgentConfig":      schema_value::<SlotAgentConfig>(),
-            "SlotState":            schema_value::<SlotState>(),
-            "SlotMode":             schema_value::<SlotMode>(),
-            "SlotUpdate":           schema_value::<SlotUpdate>(),
-            "SlotCreateRequest":    schema_value::<SlotCreateRequest>(),
-            "SlotPatchRequest":     schema_value::<SlotPatchRequest>(),
-            "SlotDuplicateRequest": schema_value::<SlotDuplicateRequest>(),
-            "SlotResponse":         schema_value::<SlotResponse>(),
-            "SlotListResponse":     schema_value::<SlotListResponse>(),
-            "SlotError":            schema_value::<SlotError>(),
-            "SlotMessageRequest":   schema_value::<SlotMessageRequest>(),
-            "SlotApproveRequest":   schema_value::<SlotApproveRequest>(),
-            "ProviderInfo":         schema_value::<ProviderInfo>(),
-            "ProviderListResponse": schema_value::<ProviderListResponse>(),
-            "PersonaPreset":        schema_value::<PersonaPreset>(),
-            "PersonaListResponse":  schema_value::<PersonaListResponse>(),
-            "PersonaError":         schema_value::<PersonaError>(),
+            "ConfigApiError":   schema_value::<ConfigApiError>(),
+            "PropPutBody":      schema_value::<PropPutBody>(),
+            "PropResponse":     schema_value::<PropResponse>(),
+            "SecretResponse":   schema_value::<SecretResponse>(),
+            "ListResponse":     schema_value::<ListResponse>(),
+            "PatchOp":          schema_value::<PatchOp>(),
+            "PatchResponse":    schema_value::<PatchResponse>(),
+            "InitQuery":        schema_value::<InitQuery>(),
+            "InitResponse":     schema_value::<InitResponse>(),
+            "MigrateResponse":  schema_value::<MigrateResponse>(),
+            "DriftEntry":       schema_value::<DriftEntry>(),
+            "DriftResponse":    schema_value::<DriftResponse>(),
+            "ReloadStatusResponse": schema_value::<ReloadStatusResponse>(),
+            "Config":           schema_value::<zeroclaw_config::schema::Config>(),
         },
         "securitySchemes": {
             "bearerAuth": {
@@ -126,7 +102,7 @@ pub fn build_spec() -> serde_json::Value {
         "in": "query",
         "required": true,
         "schema": { "type": "string" },
-        "description": "Dotted property path, e.g. `providers.fallback`."
+        "description": "Dotted property path, e.g. `agents.researcher.model_provider`."
     });
 
     let prefix_param = serde_json::json!({
@@ -142,7 +118,7 @@ pub fn build_spec() -> serde_json::Value {
         "in": "query",
         "required": false,
         "schema": { "type": "string" },
-        "description": "Section prefix to scope the init pass (e.g. `providers`)."
+        "description": "Section prefix to scope the init pass (e.g. `model_providers`)."
     });
 
     let error_responses = serde_json::json!({
@@ -282,6 +258,19 @@ pub fn build_spec() -> serde_json::Value {
                 }
             }
         },
+        "/api/config/reload-status": {
+            "get": {
+                "tags": ["config"],
+                "summary": "Pending-reload flag for the running daemon",
+                "description": "Returns `{pending_reload: true}` when one or more config writes have landed since the last `/admin/reload`. Distinct from `/api/config/drift`, which compares disk to in-memory; this flag fires on in-process PATCHes that hot-swap memory but still need subsystem re-init (channels, providers, scheduler) to take effect.",
+                "responses": {
+                    "200": {
+                        "description": "Pending-reload flag.",
+                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ReloadStatusResponse" } } }
+                    }
+                }
+            }
+        },
         "/api/config/migrate": {
             "post": {
                 "tags": ["config"],
@@ -291,311 +280,6 @@ pub fn build_spec() -> serde_json::Value {
                     "200": {
                         "description": "Migration applied (or already at the current schema version).",
                         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/MigrateResponse" } } }
-                    }
-                }
-            }
-        },
-        "/api/slots": {
-            "get": {
-                "tags": ["slots"],
-                "summary": "List dashboard slots",
-                "description": "Returns every slot for the authenticated user, ordered newest-updated first.",
-                "responses": {
-                    "200": {
-                        "description": "Slot list.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotListResponse" } } }
-                    },
-                    "503": {
-                        "description": "Slot persistence is disabled.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            },
-            "post": {
-                "tags": ["slots"],
-                "summary": "Create a slot",
-                "description": "Creates a slot with optional per-slot agent config. Returns 200 with a `Warning` header when the soft limit is crossed and 429 with `Retry-After` when the hard limit is hit.",
-                "requestBody": {
-                    "required": false,
-                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotCreateRequest" } } }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Slot created.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotResponse" } } }
-                    },
-                    "429": {
-                        "description": "Slot hard limit reached.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    },
-                    "503": {
-                        "description": "Slot persistence is disabled.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            }
-        },
-        "/api/slots/{id}": {
-            "parameters": [{
-                "name": "id",
-                "in": "path",
-                "required": true,
-                "schema": { "type": "string" },
-                "description": "Slot id (UUID)."
-            }],
-            "get": {
-                "tags": ["slots"],
-                "summary": "Fetch a single slot",
-                "responses": {
-                    "200": {
-                        "description": "Slot body.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotResponse" } } }
-                    },
-                    "404": {
-                        "description": "Slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            },
-            "patch": {
-                "tags": ["slots"],
-                "summary": "Update a slot",
-                "description": "Apply a partial update to title, agent config, state, or workspace.",
-                "requestBody": {
-                    "required": true,
-                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotPatchRequest" } } }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Updated slot.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotResponse" } } }
-                    },
-                    "404": {
-                        "description": "Slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            },
-            "delete": {
-                "tags": ["slots"],
-                "summary": "Delete a slot",
-                "description": "Removes the slot metadata. Does not delete the backing memory session.",
-                "responses": {
-                    "204": { "description": "Slot deleted." },
-                    "404": {
-                        "description": "Slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            }
-        },
-        "/api/slots/{id}/duplicate": {
-            "parameters": [{
-                "name": "id",
-                "in": "path",
-                "required": true,
-                "schema": { "type": "string" },
-                "description": "Source slot id."
-            }],
-            "post": {
-                "tags": ["slots"],
-                "summary": "Duplicate a slot",
-                "description": "Clones the source slot's agent config and workspace. `include_history: true` shares the source's session; `false` (default) mints a fresh session id.",
-                "requestBody": {
-                    "required": false,
-                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotDuplicateRequest" } } }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Duplicated slot.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotResponse" } } }
-                    },
-                    "404": {
-                        "description": "Source slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    },
-                    "429": {
-                        "description": "Slot hard limit reached.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            }
-        },
-        "/api/slots/{id}/messages": {
-            "parameters": [{
-                "name": "id",
-                "in": "path",
-                "required": true,
-                "schema": { "type": "string" },
-                "description": "Slot id."
-            }],
-            "post": {
-                "tags": ["slots"],
-                "summary": "Send a message to a slot and stream the agent response as SSE",
-                "description": "Acquires a slot-keyed queue slot, flips slot state to Running, and returns a Server-Sent Events stream of chat deltas terminating with a `done` event. M2 pragmatic slice returns a stub acknowledgement; real streaming lands with the warm `SlotRegistry` refactor (M2.5).",
-                "requestBody": {
-                    "required": true,
-                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotMessageRequest" } } }
-                },
-                "responses": {
-                    "200": {
-                        "description": "SSE stream of chat deltas. Each event is JSON matching the `chat` event shape with `role`, `content`, `done`.",
-                        "content": { "text/event-stream": {} }
-                    },
-                    "404": {
-                        "description": "Slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    },
-                    "429": {
-                        "description": "Slot queue full; another turn is in flight.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    },
-                    "503": {
-                        "description": "Slot persistence disabled, or queue acquire timed out.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            }
-        },
-        "/api/slots/{id}/stop": {
-            "parameters": [{
-                "name": "id",
-                "in": "path",
-                "required": true,
-                "schema": { "type": "string" },
-                "description": "Slot id."
-            }],
-            "post": {
-                "tags": ["slots"],
-                "summary": "Cancel a slot's in-flight turn",
-                "description": "Looks up the slot-keyed cancel token and triggers cancellation. Returns `{\"status\":\"aborted\"}` when a token was found and cancelled, `{\"status\":\"no_active_response\"}` when the slot exists but no turn is running.",
-                "responses": {
-                    "200": {
-                        "description": "Cancellation attempted.",
-                        "content": { "application/json": {} }
-                    },
-                    "404": {
-                        "description": "Slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            }
-        },
-        "/api/slots/{id}/approve": {
-            "parameters": [{
-                "name": "id",
-                "in": "path",
-                "required": true,
-                "schema": { "type": "string" },
-                "description": "Slot id."
-            }],
-            "post": {
-                "tags": ["slots"],
-                "summary": "Resolve a pending tool-approval for a slot",
-                "description": "Publishes a slot-scoped `approval_response` event onto the broadcast bus. The slot-spawned agent loop (M2.5+) resolves its pending approval oneshot keyed by `request_id`.",
-                "requestBody": {
-                    "required": true,
-                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotApproveRequest" } } }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Approval response accepted.",
-                        "content": { "application/json": {} }
-                    },
-                    "400": {
-                        "description": "Invalid `decision` value.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    },
-                    "404": {
-                        "description": "Slot does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SlotError" } } }
-                    }
-                }
-            }
-        },
-        "/api/providers": {
-            "get": {
-                "tags": ["providers"],
-                "summary": "List configured model providers",
-                "description": "Returns one entry per configured `[providers.models.*]` section with id, human-readable display name, the provider entry's currently-configured model, and a `is_fallback` flag identifying the gateway's fallback. Empty list when no providers are configured. The slot settings drawer reads this to populate its provider dropdown.",
-                "responses": {
-                    "200": {
-                        "description": "Provider list (alphabetical by id).",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ProviderListResponse" } } }
-                    }
-                }
-            }
-        },
-        "/api/personas": {
-            "get": {
-                "tags": ["personas"],
-                "summary": "List persona presets",
-                "description": "Returns every persona preset under `<workspace_dir>/personas/`, alphabetical by name. On first call against an empty/missing personas dir, the four bundled defaults (`claude-code-default`, `codex-researcher`, `gemini-cli-coder`, `bedrock-claude`) are seeded.",
-                "responses": {
-                    "200": {
-                        "description": "Persona preset list.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaListResponse" } } }
-                    }
-                }
-            },
-            "post": {
-                "tags": ["personas"],
-                "summary": "Create or overwrite a persona preset",
-                "description": "Upserts the persona keyed by `name` in the request body. Names are sandboxed via `[A-Za-z0-9._-]+` (1..=64 chars, no leading dot).",
-                "requestBody": {
-                    "required": true,
-                    "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaPreset" } } }
-                },
-                "responses": {
-                    "200": {
-                        "description": "Persona saved.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaPreset" } } }
-                    },
-                    "400": {
-                        "description": "Invalid persona name.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
-                    }
-                }
-            }
-        },
-        "/api/personas/{name}": {
-            "parameters": [{
-                "name": "name",
-                "in": "path",
-                "required": true,
-                "schema": { "type": "string" },
-                "description": "Persona name."
-            }],
-            "get": {
-                "tags": ["personas"],
-                "summary": "Read a persona preset by name",
-                "responses": {
-                    "200": {
-                        "description": "Persona body.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaPreset" } } }
-                    },
-                    "400": {
-                        "description": "Invalid persona name.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
-                    },
-                    "404": {
-                        "description": "Persona does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
-                    }
-                }
-            },
-            "delete": {
-                "tags": ["personas"],
-                "summary": "Delete a persona preset",
-                "responses": {
-                    "204": { "description": "Persona deleted." },
-                    "400": {
-                        "description": "Invalid persona name.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
-                    },
-                    "404": {
-                        "description": "Persona does not exist.",
-                        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PersonaError" } } }
                     }
                 }
             }
@@ -738,30 +422,8 @@ mod tests {
         assert!(paths.get("/api/config").is_some());
         assert!(paths.get("/api/config/init").is_some());
         assert!(paths.get("/api/config/migrate").is_some());
-        // M1: dashboard slots API
-        assert!(paths.get("/api/slots").is_some());
-        assert!(paths.get("/api/slots/{id}").is_some());
-        assert!(paths.get("/api/slots/{id}/duplicate").is_some());
-        assert!(paths.get("/api/slots/{id}/messages").is_some());
-        assert!(paths.get("/api/slots/{id}/stop").is_some());
-        assert!(paths.get("/api/slots/{id}/approve").is_some());
-    }
-
-    #[cfg(feature = "schema-export")]
-    #[test]
-    fn spec_has_slot_components() {
-        let spec = build_spec();
-        let schemas = spec.pointer("/components/schemas").unwrap();
-        assert!(schemas.get("Slot").is_some());
-        assert!(schemas.get("SlotAgentConfig").is_some());
-        assert!(schemas.get("SlotCreateRequest").is_some());
-        assert!(schemas.get("SlotPatchRequest").is_some());
-        assert!(schemas.get("SlotDuplicateRequest").is_some());
-        assert!(schemas.get("SlotResponse").is_some());
-        assert!(schemas.get("SlotListResponse").is_some());
-        assert!(schemas.get("SlotError").is_some());
-        assert!(schemas.get("SlotMessageRequest").is_some());
-        assert!(schemas.get("SlotApproveRequest").is_some());
+        assert!(paths.get("/api/config/drift").is_some());
+        assert!(paths.get("/api/config/reload-status").is_some());
     }
 
     #[cfg(feature = "schema-export")]

@@ -34,11 +34,11 @@ impl Tool for CronListTool {
     }
 
     async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        if !self.config.cron.enabled {
+        if !self.config.scheduler.enabled {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
+                error: Some("cron is disabled by config (scheduler.enabled=false)".to_string()),
             });
         }
 
@@ -65,13 +65,11 @@ mod tests {
 
     async fn test_config(tmp: &TempDir) -> Arc<Config> {
         let config = Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("data"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        tokio::fs::create_dir_all(&config.workspace_dir)
-            .await
-            .unwrap();
+        tokio::fs::create_dir_all(&config.data_dir).await.unwrap();
         Arc::new(config)
     }
 
@@ -90,7 +88,7 @@ mod tests {
     async fn errors_when_cron_disabled() {
         let tmp = TempDir::new().unwrap();
         let mut cfg = (*test_config(&tmp).await).clone();
-        cfg.cron.enabled = false;
+        cfg.scheduler.enabled = false;
         let tool = CronListTool::new(Arc::new(cfg));
 
         let result = tool.execute(json!({})).await.unwrap();

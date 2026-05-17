@@ -143,7 +143,7 @@ impl Tool for LinkedInTool {
                 },
                 "generate_image": {
                     "type": "boolean",
-                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all providers fail."
+                    "description": "Generate an AI image for the post (requires [linkedin.image] config). Falls back to branded SVG card if all model_providers fail."
                 },
                 "image_prompt": {
                     "type": "string",
@@ -277,7 +277,16 @@ impl Tool for LinkedInTool {
                         }
                         Err(e) => {
                             // Image generation failed entirely — post without image
-                            tracing::warn!("Image generation failed, posting without image: {e}");
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                                "Image generation failed, posting without image"
+                            );
                         }
                     }
                 }

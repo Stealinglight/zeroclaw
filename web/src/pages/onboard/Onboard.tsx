@@ -17,11 +17,12 @@
 // /api/config/list?prefix=<that> and PATCHes on save. Provider model
 // fields auto-fetch /api/onboard/catalog/models for the datalist.
 
-import { Suspense, lazy, useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Check, ChevronRight } from 'lucide-react';
 import {
   ApiError,
+  getMapKeys,
   getProp,
   getSections,
   patchConfig,
@@ -34,58 +35,25 @@ import FieldForm, { type FieldFormHandle } from '../../components/onboard/FieldF
 import SectionPicker from '../../components/onboard/SectionPicker';
 
 // Personality pulls in CodeMirror + markdown rendering (~270KB gzipped).
-// Lazy-load so the cost isn't paid until the user actually opens that
-// section. Other onboard sections stay synchronous.
-const PersonalityEditor = lazy(
-  () => import('../../components/onboard/PersonalityEditor'),
-);
-
 // Note: prefix is `onboard_state` (verbatim) and the field becomes
 // `completed-sections` (snake → kebab via the macro). Matches what
 // `Config::prop_fields()` actually emits — fully-kebab `onboard-state.*`
 // is wrong and produces `path_not_found` from set_prop.
 const COMPLETED_SECTIONS_PATH = 'onboard_state.completed-sections';
 
-// Wizard sections in TUI order (`zeroclaw onboard`'s `Section::as_path_prefix`
-// dispatch in `crates/zeroclaw-runtime/src/onboard/mod.rs`). The dashboard
-// wizard mirrors the CLI/TUI flow exactly — only these 6 sections, walked
-// in this order. The Config explorer at `/config` and the per-section
-// editors at `/setup/<section>` are the surfaces for everything else;
-// `/onboard` stays a focused setup-completion flow.
-const ONBOARD_SECTION_ORDER = [
-  'workspace',
-  'providers',
-  'channels',
-  'memory',
-  'hardware',
-  'tunnel',
-  // Personality is intentionally last — the structural sections above
-  // (workspace, providers, memory, …) are answered first so the markdown
-  // files the user authors here can reference whatever was just
-  // configured. Mirrors the CLI/TUI run_all() loop.
-  'personality',
-] as const;
-
-// Sections handled by a dedicated component instead of the schema-driven
-// FieldForm. The gateway's /api/onboard/sections doesn't enumerate
-// these — they're synthesized client-side and slotted into the same
-// sidebar/breadcrumb/Next/Finish flow as the schema-backed sections.
-const SYNTHETIC_SECTIONS: Record<string, SectionInfo> = {
-  personality: {
-    key: 'personality',
-    label: 'Personality',
-    help: 'Edit the markdown files that shape your agent — SOUL, IDENTITY, USER, etc.',
-    has_picker: false,
-    completed: false,
-    group: 'Onboarding',
-  },
-};
+// Section list + its canonical order both come from the gateway,
+// which derives them from `zeroclaw_config::sections::ONBOARDING_SECTIONS`
+// (single source of truth, also used by the CLI runtime). The frontend
+// filters by `is_onboarding` and trusts response order — no client-side
+// list to drift out of sync with the Rust canonical const.
 
 export default function Onboard() {
   const navigate = useNavigate();
   const [sections, setSections] = useState<SectionInfo[]>([]);
   const [activeKey, setActiveKey] = useState<string | null>(null);
   const [picked, setPicked] = useState<{ item: PickerItem; fieldsPrefix: string } | null>(null);
+  // When a provider/channel type is selected, show alias list inline before opening form.
+  const [pickedType, setPickedType] = useState<{ item: PickerItem; sectionKey: string } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [finishing, setFinishing] = useState(false);
@@ -101,15 +69,8 @@ export default function Onboard() {
     getSections()
       .then((resp) => {
         if (cancelled) return;
-        // Mirror the TUI flow: only the 6 onboarding sections, in their
-        // canonical order. The gateway returns every top-level config
-        // section now (#6175 schema-driven discovery) — we filter +
-        // re-order here to keep `/onboard` focused on setup completion.
-        const byKey = new Map(resp.sections.map((s) => [s.key, s] as const));
-        const ordered = ONBOARD_SECTION_ORDER.flatMap((k) => {
-          const s = byKey.get(k) ?? SYNTHETIC_SECTIONS[k];
-          return s ? [s] : [];
-        });
+        // Filter to wizard sections; trust gateway-provided order.
+        const ordered = resp.sections.filter((s) => s.is_onboarding);
         setSections(ordered);
         // Open the first not-yet-completed section.
         const next = ordered.find((s) => !s.completed);
@@ -137,18 +98,33 @@ export default function Onboard() {
   const goToSection = (key: string) => {
     setActiveKey(key);
     setPicked(null);
+    setPickedType(null);
+  };
+
+  const openWithAlias = async (item: PickerItem, sectionKey: string, alias: string) => {
+    const resp = await selectSectionItem(sectionKey, item.key, alias);
+    setPickedType(null);
+    setPicked({ item, fieldsPrefix: resp.fields_prefix });
   };
 
   const handlePick = async (item: PickerItem) => {
     if (!activeSection) return;
+    // Two-tier `<type>.<alias>` sections (typed-family providers and
+    // channels) flow into the type→alias picker; everything else picks
+    // its item directly. Server-emitted shape drives the branch — no
+    // hardcoded section keys.
+    if (activeSection.shape === 'typed_family_map') {
+      setPickedType({ item, sectionKey: activeSection.key });
+      return;
+    }
     try {
       const resp = await selectSectionItem(activeSection.key, item.key);
       setPicked({ item, fieldsPrefix: resp.fields_prefix });
     } catch (e) {
       if (e instanceof ApiError) {
-        setError(`Couldn't select ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
+        setError(`Couldn't open ${item.label}: [${e.envelope.code}] ${e.envelope.message}`);
       } else {
-        setError(`Couldn't select ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
+        setError(`Couldn't open ${item.label}: ${e instanceof Error ? e.message : String(e)}`);
       }
     }
   };
@@ -192,9 +168,10 @@ export default function Onboard() {
       if (next) {
         setActiveKey(next.key);
         setPicked(null);
+        setPickedType(null);
       } else {
-        // Wizard done — stay on current section but clear picked state.
         setPicked(null);
+        setPickedType(null);
       }
     } finally {
       setAdvancing(false);
@@ -332,23 +309,32 @@ export default function Onboard() {
                 <ChevronRight className="h-3 w-3" />
                 <span
                   style={{
-                    color: picked
-                      ? 'var(--pc-text-secondary)'
-                      : 'var(--pc-accent)',
-                    cursor: picked ? 'pointer' : 'default',
-                    fontWeight: picked ? 400 : 600,
+                    color: picked || pickedType ? 'var(--pc-text-secondary)' : 'var(--pc-accent)',
+                    cursor: picked || pickedType ? 'pointer' : 'default',
+                    fontWeight: picked || pickedType ? 400 : 600,
                   }}
-                  onClick={() => picked && setPicked(null)}
+                  onClick={() => { setPicked(null); setPickedType(null); }}
                 >
                   {activeSection.label}
                 </span>
+                {pickedType && (
+                  <>
+                    <ChevronRight className="h-3 w-3" />
+                    <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                      {pickedType.item.label}
+                    </span>
+                  </>
+                )}
                 {picked && (
                   <>
                     <ChevronRight className="h-3 w-3" />
-                    <span
-                      style={{ color: 'var(--pc-accent)', fontWeight: 600 }}
-                    >
+                    <span style={{ color: 'var(--pc-text-secondary)', cursor: 'pointer' }}
+                      onClick={(e) => { e.stopPropagation(); setPickedType({ item: picked.item, sectionKey: activeSection.key }); setPicked(null); }}>
                       {picked.item.label}
+                    </span>
+                    <ChevronRight className="h-3 w-3" />
+                    <span style={{ color: 'var(--pc-accent)', fontWeight: 600 }}>
+                      {picked.fieldsPrefix.split('.').slice(-1)[0]}
                     </span>
                   </>
                 )}
@@ -382,57 +368,312 @@ export default function Onboard() {
               </div>
             </div>
 
-            {/* Picker view OR form view. Direct-form sections (Workspace,
-                Hardware) skip the picker entirely. */}
-            {activeSection.key === 'personality' ? (
-              <Suspense fallback={<EditorLoading />}>
-                <PersonalityEditor />
-              </Suspense>
-            ) : !activeSection.has_picker ? (
+            {/* Picker / form dispatch — driven by the server-emitted
+                `shape` flag so /onboard and /config render identically
+                for the same section. */}
+            {!activeSection.has_picker ? (
               <FieldForm
                 ref={formRef}
                 prefix={activeSection.key}
                 title={activeSection.label}
               />
-            ) : !picked ? (
+            ) : picked ? (
+              <FieldForm
+                ref={formRef}
+                prefix={picked.fieldsPrefix}
+                title={picked.item.label}
+                onSaved={() => setPicked(null)}
+              />
+            ) : pickedType ? (
+              <OnboardAliasListView
+                sectionKey={pickedType.sectionKey}
+                typeKey={pickedType.item.key}
+                typeLabel={pickedType.item.label}
+                onSelectAlias={(alias) => openWithAlias(pickedType.item, pickedType.sectionKey, alias)}
+              />
+            ) : activeSection.shape === 'one_tier_alias_map' ? (
+              // Flat alias map (agents). Same UX as /config/<section>:
+              // alias list with `+ Add`. Picking an alias opens its form.
+              <OnboardOneTierAliasView
+                sectionKey={activeSection.key}
+                onSelectAlias={async (alias) => {
+                  try {
+                    const resp = await selectSectionItem(activeSection.key, alias);
+                    setPicked({
+                      item: { key: alias, label: alias },
+                      fieldsPrefix: resp.fields_prefix,
+                    });
+                  } catch (e) {
+                    setError(
+                      e instanceof ApiError
+                        ? `[${e.envelope.code}] ${e.envelope.message}`
+                        : `Couldn't open ${alias}: ${e instanceof Error ? e.message : String(e)}`,
+                    );
+                  }
+                }}
+              />
+            ) : (
               <SectionPicker
                 sectionKey={activeSection.key}
                 help={activeSection.help}
                 onPick={(item) => void handlePick(item)}
                 onSkip={() => void advanceSection()}
               />
-            ) : (
-              <FieldForm
-                ref={formRef}
-                prefix={picked.fieldsPrefix}
-                title={picked.item.label}
-                onSaved={() => {
-                  // Return to the picker so the user can add another or
-                  // hit Next/Finish in the breadcrumb row.
-                  setPicked(null);
-                }}
-              />
             )}
           </div>
         )}
       </main>
+
     </div>
   );
 }
 
-function EditorLoading() {
+function OnboardAliasListView({
+  sectionKey,
+  typeKey,
+  typeLabel,
+  onSelectAlias,
+}: {
+  sectionKey: string;
+  typeKey: string;
+  typeLabel: string;
+  onSelectAlias: (alias: string) => Promise<void>;
+}) {
+  const [aliases, setAliases] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [newAlias, setNewAlias] = useState('');
+  const [aliasError, setAliasError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const mapPath = `${sectionKey}.${typeKey}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getMapKeys(mapPath)
+      .then((r) => { if (!cancelled) setAliases(r.keys); })
+      .catch(() => { if (!cancelled) setAliases([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [mapPath]);
+
+  const submit = async () => {
+    const trimmed = newAlias.trim() || (aliases.length === 0 ? 'default' : `${aliases[0]}-2`);
+    setAliasError(null);
+    try {
+      await onSelectAlias(trimmed);
+    } catch (e) {
+      setAliasError(
+        e instanceof ApiError ? e.envelope.message : (e instanceof Error ? e.message : String(e)),
+      );
+    }
+  };
+
+  return (
+    <div className="flex flex-col gap-3">
+      <p className="text-sm" style={{ color: 'var(--pc-text-secondary)' }}>
+        {typeLabel} — select or create an alias
+      </p>
+      <AliasHelpBox what={typeLabel} />
+      {loading ? (
+        <div className="flex items-center justify-center py-12">
+          <div className="h-8 w-8 border-2 rounded-full animate-spin"
+            style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+        </div>
+      ) : (
+        <>
+          {error && (
+            <div
+              className="rounded-xl border p-3 text-sm"
+              style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.2)', color: '#f87171' }}
+            >
+              {error}
+            </div>
+          )}
+          <div className="surface-panel divide-y" style={{ borderColor: 'var(--pc-border)' }}>
+          {aliases.map((alias) => (
+            <button
+              key={alias}
+              type="button"
+              onClick={() => {
+                onSelectAlias(alias).catch((e) => {
+                  setError(
+                    e instanceof ApiError
+                      ? `[${e.envelope.code}] ${e.envelope.message}`
+                      : (e instanceof Error ? e.message : String(e)),
+                  );
+                });
+              }}
+              className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors hover:opacity-90"
+            >
+              <div>
+                <span style={{ color: 'var(--pc-text-primary)', fontWeight: 500 }}>{alias}</span>
+                <code className="block text-xs mt-0.5" style={{ color: 'var(--pc-text-faint)' }}>
+                  {mapPath}.{alias}
+                </code>
+              </div>
+              <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
+            </button>
+          ))}
+          <div className="flex flex-col gap-1 px-4 py-3">
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input-electric flex-1 px-3 py-1.5 text-sm"
+                placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
+                value={newAlias}
+                onChange={(e) => { setNewAlias(e.target.value); setAliasError(null); }}
+                onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+                // eslint-disable-next-line jsx-a11y/no-autofocus
+                autoFocus={aliases.length === 0}
+              />
+              <button type="button" onClick={() => void submit()} className="btn-electric text-sm px-3 py-1.5 flex-shrink-0">
+                Add
+              </button>
+            </div>
+            {aliasError && (
+              <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>{aliasError}</p>
+            )}
+          </div>
+        </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+/// Help block shown above every alias-input field (one-tier and typed-family
+/// alike) so the user knows what they're naming and what the rules are.
+/// Constraints come from `validate_alias_key` in zeroclaw-config — keep this
+/// blurb in sync with that validator's rules if they ever loosen.
+function AliasHelpBox({ what }: { what: string }) {
   return (
     <div
-      className="flex items-center justify-center rounded-xl border p-12"
+      className="rounded-md border px-3 py-2 text-xs"
       style={{
         borderColor: 'var(--pc-border)',
-        background: 'var(--pc-bg-surface)',
+        background: 'var(--pc-bg-surface-subtle)',
+        color: 'var(--pc-text-secondary)',
       }}
     >
-      <div
-        className="h-6 w-6 border-2 rounded-full animate-spin"
-        style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }}
-      />
+      <p className="mb-1">
+        <strong>{what} alias.</strong> A short stable name you’ll use everywhere
+        else in config to point at this entry (e.g. agents and routes reference
+        it as <code>{'<type>'}.{'<alias>'}</code>). Aliases let you have several
+        entries of the same type — a <code>work</code> credential and a{' '}
+        <code>personal</code> one, for example.
+      </p>
+      <p className="mb-0">
+        Rules: lowercase letters, digits, single underscores; 1–63 chars; no
+        leading/trailing/double underscores, no dots, hyphens, or spaces.{' '}
+        <strong>Aliases can’t be renamed in v0.8.0</strong> — pick something
+        you’ll keep, or delete and recreate.
+      </p>
+    </div>
+  );
+}
+
+function OnboardOneTierAliasView({
+  sectionKey,
+  onSelectAlias,
+}: {
+  sectionKey: string;
+  onSelectAlias: (alias: string) => Promise<void>;
+}) {
+  const [aliases, setAliases] = useState<string[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [newAlias, setNewAlias] = useState('');
+  const [aliasError, setAliasError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getMapKeys(sectionKey)
+      .then((r) => { if (!cancelled) setAliases(r.keys); })
+      .catch(() => { if (!cancelled) setAliases([]); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [sectionKey]);
+
+  const submit = async () => {
+    const trimmed = newAlias.trim() || (aliases.length === 0 ? 'default' : `${aliases[0]}-2`);
+    setAliasError(null);
+    try {
+      await onSelectAlias(trimmed);
+    } catch (e) {
+      setAliasError(
+        e instanceof ApiError ? e.envelope.message : (e instanceof Error ? e.message : String(e)),
+      );
+    }
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="h-8 w-8 border-2 rounded-full animate-spin"
+          style={{ borderColor: 'var(--pc-border)', borderTopColor: 'var(--pc-accent)' }} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <AliasHelpBox what={sectionKey === 'agents' ? 'Agent' : 'Entry'} />
+      {error && (
+        <div
+          className="rounded-xl border p-3 text-sm"
+          style={{ background: 'rgba(239,68,68,0.08)', borderColor: 'rgba(239,68,68,0.2)', color: '#f87171' }}
+        >
+          {error}
+        </div>
+      )}
+      <div className="surface-panel divide-y" style={{ borderColor: 'var(--pc-border)' }}>
+        {aliases.map((alias) => (
+          <button
+            key={alias}
+            type="button"
+            onClick={() => {
+              onSelectAlias(alias).catch((e) => {
+                setError(
+                  e instanceof ApiError
+                    ? `[${e.envelope.code}] ${e.envelope.message}`
+                    : (e instanceof Error ? e.message : String(e)),
+                );
+              });
+            }}
+            className="w-full flex items-center justify-between gap-3 px-4 py-3 text-left text-sm transition-colors hover:opacity-90"
+          >
+            <div>
+              <span style={{ color: 'var(--pc-text-primary)', fontWeight: 500 }}>{alias}</span>
+              <code className="block text-xs mt-0.5" style={{ color: 'var(--pc-text-faint)' }}>
+                {sectionKey}.{alias}
+              </code>
+            </div>
+            <ChevronRight className="h-4 w-4 flex-shrink-0" style={{ color: 'var(--pc-text-muted)' }} />
+          </button>
+        ))}
+        <div className="flex flex-col gap-1 px-4 py-3">
+          <div className="flex items-center gap-2">
+            <input
+              type="text"
+              className="input-electric flex-1 px-3 py-1.5 text-sm"
+              placeholder={aliases.length === 0 ? 'default' : `${aliases[0]}-2`}
+              value={newAlias}
+              onChange={(e) => { setNewAlias(e.target.value); setAliasError(null); }}
+              onKeyDown={(e) => { if (e.key === 'Enter') void submit(); }}
+              // eslint-disable-next-line jsx-a11y/no-autofocus
+              autoFocus={aliases.length === 0}
+            />
+            <button type="button" onClick={() => void submit()} className="btn-electric text-sm px-3 py-1.5 flex-shrink-0">
+              Add
+            </button>
+          </div>
+          {aliasError && (
+            <p className="text-xs" style={{ color: 'var(--color-status-error)' }}>{aliasError}</p>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

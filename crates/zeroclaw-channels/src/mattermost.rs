@@ -1,7 +1,8 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
+use tokio::sync::OnceCell;
 use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 
 const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
@@ -10,9 +11,25 @@ const MAX_MATTERMOST_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
 /// Mattermost is API-compatible with many Slack patterns but uses a dedicated v4 structure.
 pub struct MattermostChannel {
     base_url: String, // e.g., https://mm.example.com
-    bot_token: String,
-    channel_id: Option<String>,
-    allowed_users: Vec<String>,
+    /// Static bot token from the config. Preferred over login when set.
+    bot_token: Option<String>,
+    /// Login ID for the password login flow. Used when `bot_token` is None.
+    login_id: Option<String>,
+    /// Password for the login flow. Used when `bot_token` is None.
+    password: Option<String>,
+    /// Resolved session token used by all API calls. Populated lazily on
+    /// first use, either by copying `bot_token` or by performing the login
+    /// flow with `login_id` and `password`.
+    session_token: OnceCell<String>,
+    /// Channel IDs to listen on. Currently only the first is used at runtime;
+    /// multi-channel listening lands separately.
+    channel_ids: Vec<String>,
+    /// The alias key under `[channels.mattermost.<alias>]` this handle is
+    /// bound to. Used to scope peer-group writes and resolver lookups.
+    alias: String,
+    /// Resolves inbound external peers from canonical state at message-time.
+    /// No cache (see AGENTS.md "ABSOLUTE RULE — SINGLE SOURCE OF TRUTH").
+    peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
     /// When true (default), replies thread on the original post's root_id.
     /// When false, replies go to the channel root.
     thread_replies: bool,
@@ -29,9 +46,12 @@ pub struct MattermostChannel {
 impl MattermostChannel {
     pub fn new(
         base_url: String,
-        bot_token: String,
-        channel_id: Option<String>,
-        allowed_users: Vec<String>,
+        bot_token: Option<String>,
+        login_id: Option<String>,
+        password: Option<String>,
+        channel_ids: Vec<String>,
+        alias: impl Into<String>,
+        peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
         thread_replies: bool,
         mention_only: bool,
     ) -> Self {
@@ -40,8 +60,12 @@ impl MattermostChannel {
         Self {
             base_url,
             bot_token,
-            channel_id,
-            allowed_users,
+            login_id,
+            password,
+            session_token: OnceCell::new(),
+            channel_ids,
+            alias: alias.into(),
+            peer_resolver,
             thread_replies,
             mention_only,
             typing_handle: Mutex::new(None),
@@ -49,6 +73,69 @@ impl MattermostChannel {
             transcription: None,
             transcription_manager: None,
         }
+    }
+
+    /// Return the alias under `[channels.mattermost.<alias>]` that this
+    /// channel handle is bound to.
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// Resolve the session token, performing the login flow on first call
+    /// if `bot_token` is not set.
+    async fn token(&self) -> Result<&str> {
+        self.session_token
+            .get_or_try_init(|| async {
+                if let Some(ref t) = self.bot_token {
+                    return Ok::<String, anyhow::Error>(t.clone());
+                }
+                let login_id = self.login_id.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "bot_token is unset; configure either bot_token or both login_id and password"
+                    )
+                })?;
+                let password = self.password.as_deref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "bot_token is unset and password is missing; both login_id and password must be set"
+                    )
+                })?;
+                self.login(login_id, password).await
+            })
+            .await
+            .map(String::as_str)
+    }
+
+    /// Perform the Mattermost password login flow and return the session
+    /// token. The session token is returned via the `Token` response header
+    /// per Mattermost API v4.
+    async fn login(&self, login_id: &str, password: &str) -> Result<String> {
+        let resp = self
+            .http_client()
+            .post(format!("{}/api/v4/users/login", self.base_url))
+            .json(&serde_json::json!({
+                "login_id": login_id,
+                "password": password,
+            }))
+            .send()
+            .await
+            .context("login request failed")?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            bail!("login failed ({status}): {body}");
+        }
+        let token = resp
+            .headers()
+            .get("Token")
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| anyhow::anyhow!("login succeeded but the response had no Token header"))?
+            .to_string();
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            "login succeeded; session token cached"
+        );
+        Ok(token)
     }
 
     /// Set a per-channel proxy URL that overrides the global proxy config.
@@ -66,12 +153,28 @@ impl MattermostChannel {
         }
         match super::transcription::TranscriptionManager::new(&config) {
             Ok(m) => {
+                // Bind the sole registered provider as the agent transcription
+                // provider for the channel-direct ingest path. Multi-provider
+                // setups still resolve via the orchestrator's per-agent
+                // routing (see orchestrator/mod.rs). See wati.rs for full
+                // rationale.
+                let names = m.available_providers();
+                let m = if names.len() == 1 {
+                    let only = names[0].to_string();
+                    m.with_agent_transcription_provider(only)
+                } else {
+                    m
+                };
                 self.transcription_manager = Some(Arc::new(m));
                 self.transcription = Some(config);
             }
             Err(e) => {
-                tracing::warn!(
-                    "transcription manager init failed, voice transcription disabled: {e}"
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"e": e.to_string()})),
+                    "transcription manager init failed, voice transcription disabled"
                 );
             }
         }
@@ -90,16 +193,30 @@ impl MattermostChannel {
     /// Check if a user ID is in the allowlist.
     /// Empty list means deny everyone. "*" means allow everyone.
     fn is_user_allowed(&self, user_id: &str) -> bool {
-        self.allowed_users.iter().any(|u| u == "*" || u == user_id)
+        let peers = (self.peer_resolver)();
+        crate::allowlist::is_user_allowed(&peers, user_id, crate::allowlist::Match::Sensitive)
     }
 
     /// Get the bot's own user ID and username so we can ignore our own messages
     /// and detect @-mentions by username.
     async fn get_bot_identity(&self) -> (String, String) {
+        let token = match self.token().await {
+            Ok(t) => t.to_string(),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "auth failed in get_bot_identity"
+                );
+                return (String::new(), String::new());
+            }
+        };
         let resp: Option<serde_json::Value> = async {
             self.http_client()
                 .get(format!("{}/api/v4/users/me", self.base_url))
-                .bearer_auth(&self.bot_token)
+                .bearer_auth(&token)
                 .send()
                 .await
                 .ok()?
@@ -138,11 +255,7 @@ impl MattermostChannel {
         if let Some(duration_ms) = audio_file.get("duration").and_then(|d| d.as_u64()) {
             let duration_secs = duration_ms / 1000;
             if duration_secs > config.max_duration_secs {
-                tracing::debug!(
-                    duration_secs,
-                    max = config.max_duration_secs,
-                    "Mattermost audio attachment exceeds max duration, skipping"
-                );
+                ::zeroclaw_log::record!(DEBUG, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"duration_secs": duration_secs, "max": config.max_duration_secs})), "audio attachment exceeds max duration, skipping");
                 return None;
             }
         }
@@ -153,24 +266,49 @@ impl MattermostChannel {
             .and_then(|n| n.as_str())
             .unwrap_or("audio");
 
+        let token = match self.token().await {
+            Ok(t) => t.to_string(),
+            Err(e) => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": e.to_string(), "file_id": file_id})
+                        ),
+                    "audio download auth failed for"
+                );
+                return None;
+            }
+        };
         let response = match self
             .http_client()
             .get(format!("{}/api/v4/files/{}", self.base_url, file_id))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(&token)
             .send()
             .await
         {
             Ok(r) => r,
             Err(e) => {
-                tracing::warn!("Mattermost: audio download failed for {file_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": e.to_string(), "file_id": file_id})
+                        ),
+                    "audio download failed for"
+                );
                 return None;
             }
         };
 
         if !response.status().is_success() {
-            tracing::warn!(
-                "Mattermost: audio download returned {}: {file_id}",
-                response.status()
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!("audio download returned {}: {file_id}", response.status())
             );
             return None;
         }
@@ -178,14 +316,30 @@ impl MattermostChannel {
         if let Some(content_length) = response.content_length()
             && content_length > MAX_MATTERMOST_AUDIO_BYTES
         {
-            tracing::warn!("Mattermost: audio file too large ({content_length} bytes): {file_id}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(
+                        ::serde_json::json!({"content_length": content_length, "file_id": file_id})
+                    ),
+                "audio file too large ( bytes)"
+            );
             return None;
         }
 
         let bytes = match response.bytes().await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!("Mattermost: failed to read audio bytes for {file_id}: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(
+                            ::serde_json::json!({"error": e.to_string(), "file_id": file_id})
+                        ),
+                    "failed to read audio bytes for"
+                );
                 return None;
             }
         };
@@ -194,17 +348,38 @@ impl MattermostChannel {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
-                    tracing::info!("Mattermost: transcription returned empty text, skipping");
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        "transcription returned empty text, skipping"
+                    );
                     None
                 } else {
                     Some(format!("[Voice] {trimmed}"))
                 }
             }
             Err(e) => {
-                tracing::warn!("Mattermost audio transcription failed: {e}");
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                    "audio transcription failed"
+                );
                 None
             }
         }
+    }
+}
+
+impl ::zeroclaw_api::attribution::Attributable for MattermostChannel {
+    fn role(&self) -> ::zeroclaw_api::attribution::Role {
+        ::zeroclaw_api::attribution::Role::Channel(
+            ::zeroclaw_api::attribution::ChannelKind::Mattermost,
+        )
+    }
+    fn alias(&self) -> &str {
+        &self.alias
     }
 }
 
@@ -235,10 +410,11 @@ impl Channel for MattermostChannel {
             );
         }
 
+        let token = self.token().await?;
         let resp = self
             .http_client()
             .post(format!("{}/api/v4/posts", self.base_url))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(token)
             .json(&body_map)
             .send()
             .await?;
@@ -249,17 +425,30 @@ impl Channel for MattermostChannel {
                 .text()
                 .await
                 .unwrap_or_else(|e| format!("<failed to read response: {e}>"));
-            bail!("Mattermost post failed ({status}): {body}");
+            bail!("post failed ({status}): {body}");
         }
 
         Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
-        let channel_id = self
-            .channel_id
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Mattermost channel_id required for listening"))?;
+        let channel_id = self.channel_ids.first().cloned().ok_or_else(|| {
+            anyhow::anyhow!("channel_ids must contain at least one entry for listening")
+        })?;
+        if self.channel_ids.len() > 1 {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                &format!(
+                    "channel_ids has {} entries; only the first ({channel_id}) is currently used for listening",
+                    self.channel_ids.len()
+                )
+            );
+        }
+
+        // Resolve auth up front so misconfiguration fails fast at listen-time.
+        let initial_token = self.token().await?.to_string();
 
         let (bot_user_id, bot_username) = self.get_bot_identity().await;
         #[allow(clippy::cast_possible_truncation)]
@@ -268,7 +457,11 @@ impl Channel for MattermostChannel {
             .unwrap_or_default()
             .as_millis()) as i64;
 
-        tracing::info!("Mattermost channel listening on {}...", channel_id);
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+            &format!("channel listening on {}...", channel_id)
+        );
 
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(3)).await;
@@ -279,14 +472,20 @@ impl Channel for MattermostChannel {
                     "{}/api/v4/channels/{}/posts",
                     self.base_url, channel_id
                 ))
-                .bearer_auth(&self.bot_token)
+                .bearer_auth(&initial_token)
                 .query(&[("since", last_create_at.to_string())])
                 .send()
                 .await
             {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("Mattermost poll error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "poll error"
+                    );
                     continue;
                 }
             };
@@ -294,7 +493,13 @@ impl Channel for MattermostChannel {
             let data: serde_json::Value = match resp.json().await {
                 Ok(d) => d,
                 Err(e) => {
-                    tracing::warn!("Mattermost parse error: {e}");
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": e.to_string()})),
+                        "parse error"
+                    );
                     continue;
                 }
             };
@@ -342,9 +547,12 @@ impl Channel for MattermostChannel {
     }
 
     async fn health_check(&self) -> bool {
+        let Ok(token) = self.token().await else {
+            return false;
+        };
         self.http_client()
             .get(format!("{}/api/v4/users/me", self.base_url))
-            .bearer_auth(&self.bot_token)
+            .bearer_auth(token)
             .send()
             .await
             .map(|r| r.status().is_success())
@@ -356,7 +564,7 @@ impl Channel for MattermostChannel {
         self.stop_typing(recipient).await?;
 
         let client = self.http_client();
-        let token = self.bot_token.clone();
+        let token = self.token().await?.to_string();
         let base_url = self.base_url.clone();
 
         // recipient is "channel_id" or "channel_id:root_id"
@@ -383,7 +591,12 @@ impl Channel for MattermostChannel {
                     .await
                     && !r.status().is_success()
                 {
-                    tracing::debug!(status = %r.status(), "Mattermost typing indicator failed");
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({"status": r.status().to_string()})),
+                        "typing indicator failed"
+                    );
                 }
 
                 // Mattermost typing events expire after ~6s; re-fire every 4s.
@@ -433,7 +646,13 @@ impl MattermostChannel {
         };
 
         if !self.is_user_allowed(user_id) {
-            tracing::warn!("Mattermost: ignoring message from unauthorized user: {user_id}");
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({"user_id": user_id})),
+                "ignoring message from unauthorized user"
+            );
             return None;
         }
 
@@ -464,6 +683,7 @@ impl MattermostChannel {
             reply_target,
             content,
             channel: "mattermost".to_string(),
+            channel_alias: Some(self.alias.clone()),
             #[allow(clippy::cast_sign_loss)]
             timestamp: (create_at / 1000) as u64,
             thread_ts: None,
@@ -572,10 +792,11 @@ fn find_bot_mention_spans(text: &str, bot_username: &str) -> Vec<(usize, usize)>
     spans
 }
 
-/// Normalize incoming Mattermost content when `mention_only` is enabled.
+/// Gate incoming Mattermost content when `mention_only` is enabled.
 ///
-/// Returns `None` if the message doesn't mention the bot.
-/// Returns `Some(cleaned)` with the @-mention stripped and text trimmed.
+/// Returns `None` if the message doesn't mention the bot, otherwise the
+/// trimmed text with the mention preserved so downstream consumers can
+/// see who was addressed.
 fn normalize_mattermost_content(
     text: &str,
     bot_user_id: &str,
@@ -594,25 +815,11 @@ fn normalize_mattermost_content(
         return None;
     }
 
-    let mut cleaned = text.to_string();
-    if !mention_spans.is_empty() {
-        let mut result = String::with_capacity(text.len());
-        let mut cursor = 0;
-        for (start, end) in mention_spans {
-            result.push_str(&text[cursor..start]);
-            result.push(' ');
-            cursor = end;
-        }
-        result.push_str(&text[cursor..]);
-        cleaned = result;
-    }
-
-    let cleaned = cleaned.trim().to_string();
-    if cleaned.is_empty() {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
         return None;
     }
-
-    Some(cleaned)
+    Some(trimmed.to_string())
 }
 
 #[cfg(test)]
@@ -620,52 +827,57 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // Helper: create a channel with mention_only=false (legacy behavior).
-    fn make_channel(allowed: Vec<String>, thread_replies: bool) -> MattermostChannel {
-        MattermostChannel::new(
-            "url".into(),
-            "token".into(),
-            None,
-            allowed,
-            thread_replies,
-            false,
-        )
-    }
-
-    // Helper: create a channel with mention_only=true.
-    fn make_mention_only_channel() -> MattermostChannel {
-        MattermostChannel::new(
-            "url".into(),
-            "token".into(),
-            None,
-            vec!["*".into()],
-            true,
-            true,
-        )
-    }
-
     #[test]
     fn mattermost_url_trimming() {
+        let thread_replies = false;
+        let mention_only = false;
         let ch = MattermostChannel::new(
             "https://mm.example.com/".into(),
-            "token".into(),
+            Some("token".into()),
             None,
-            vec![],
-            false,
-            false,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(Vec::new),
+            thread_replies,
+            mention_only,
         );
         assert_eq!(ch.base_url, "https://mm.example.com");
     }
 
     #[test]
     fn mattermost_allowlist_wildcard() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         assert!(ch.is_user_allowed("any-id"));
     }
 
     #[test]
     fn mattermost_parse_post_basic() {
-        let ch = make_channel(vec!["*".into()], true);
+        let thread_replies = true;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -691,7 +903,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_thread_replies_enabled() {
-        let ch = make_channel(vec!["*".into()], true);
+        let thread_replies = true;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -715,7 +939,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_thread() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -739,7 +975,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_ignore_self() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "bot123",
@@ -760,7 +1008,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_ignore_old() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -781,7 +1041,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_no_thread_when_disabled() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -806,7 +1078,19 @@ mod tests {
     #[test]
     fn mattermost_existing_thread_always_threads() {
         // Even with thread_replies=false, replies to existing threads stay in the thread
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -832,7 +1116,19 @@ mod tests {
 
     #[test]
     fn mention_only_skips_message_without_mention() {
-        let ch = make_mention_only_channel();
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -854,7 +1150,19 @@ mod tests {
 
     #[test]
     fn mention_only_accepts_message_with_at_mention() {
-        let ch = make_mention_only_channel();
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -873,12 +1181,24 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(msg.content, "what is the weather?");
+        assert_eq!(msg.content, "@mybot what is the weather?");
     }
 
     #[test]
-    fn mention_only_strips_mention_and_trims() {
-        let ch = make_mention_only_channel();
+    fn mention_only_preserves_mention_in_body() {
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -897,12 +1217,24 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(msg.content, "run status");
+        assert_eq!(msg.content, "@mybot  run status");
     }
 
     #[test]
-    fn mention_only_rejects_empty_after_stripping() {
-        let ch = make_mention_only_channel();
+    fn mention_only_admits_caption_that_is_only_the_mention() {
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -911,20 +1243,34 @@ mod tests {
             "root_id": ""
         });
 
-        let msg = ch.parse_mattermost_post(
-            &post,
-            "bot123",
-            "mybot",
-            1_500_000_000_000_i64,
-            "chan1",
-            None,
-        );
-        assert!(msg.is_none());
+        let msg = ch
+            .parse_mattermost_post(
+                &post,
+                "bot123",
+                "mybot",
+                1_500_000_000_000_i64,
+                "chan1",
+                None,
+            )
+            .unwrap();
+        assert_eq!(msg.content, "@mybot");
     }
 
     #[test]
     fn mention_only_case_insensitive() {
-        let ch = make_mention_only_channel();
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -943,13 +1289,25 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(msg.content, "hello");
+        assert_eq!(msg.content, "@MyBot hello");
     }
 
     #[test]
     fn mention_only_detects_metadata_mentions() {
         // Even without @username in text, metadata.mentions should trigger.
-        let ch = make_mention_only_channel();
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -977,7 +1335,19 @@ mod tests {
 
     #[test]
     fn mention_only_word_boundary_prevents_partial_match() {
-        let ch = make_mention_only_channel();
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         // "@mybotextended" should NOT match "@mybot" because it extends the username.
         let post = json!({
             "id": "post1",
@@ -1000,7 +1370,19 @@ mod tests {
 
     #[test]
     fn mention_only_mention_in_middle_of_text() {
-        let ch = make_mention_only_channel();
+        let thread_replies = true;
+        let mention_only = true;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -1019,13 +1401,25 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(msg.content, "hey   how are you?");
+        assert_eq!(msg.content, "hey @mybot how are you?");
     }
 
     #[test]
     fn mention_only_disabled_passes_all_messages() {
         // With mention_only=false (default), messages pass through unfiltered.
-        let ch = make_channel(vec!["*".into()], true);
+        let thread_replies = true;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post1",
             "user_id": "user1",
@@ -1145,10 +1539,10 @@ mod tests {
     // ── normalize_mattermost_content unit tests ───────────────────
 
     #[test]
-    fn normalize_strips_and_trims() {
+    fn normalize_preserves_mention_and_trims() {
         let post = json!({});
         let result = normalize_mattermost_content("  @mybot  do stuff  ", "bot123", "mybot", &post);
-        assert_eq!(result.as_deref(), Some("do stuff"));
+        assert_eq!(result.as_deref(), Some("@mybot  do stuff"));
     }
 
     #[test]
@@ -1159,10 +1553,10 @@ mod tests {
     }
 
     #[test]
-    fn normalize_returns_none_when_only_mention() {
+    fn normalize_admits_mention_only_caption() {
         let post = json!({});
         let result = normalize_mattermost_content("@mybot", "bot123", "mybot", &post);
-        assert!(result.is_none());
+        assert_eq!(result.as_deref(), Some("@mybot"));
     }
 
     #[test]
@@ -1175,11 +1569,11 @@ mod tests {
     }
 
     #[test]
-    fn normalize_strips_multiple_mentions() {
+    fn normalize_preserves_multiple_mentions() {
         let post = json!({});
         let result =
             normalize_mattermost_content("@mybot hello @mybot world", "bot123", "mybot", &post);
-        assert_eq!(result.as_deref(), Some("hello   world"));
+        assert_eq!(result.as_deref(), Some("@mybot hello @mybot world"));
     }
 
     #[test]
@@ -1187,60 +1581,92 @@ mod tests {
         let post = json!({});
         let result =
             normalize_mattermost_content("@mybot hello @mybotx world", "bot123", "mybot", &post);
-        assert_eq!(result.as_deref(), Some("hello @mybotx world"));
+        assert_eq!(result.as_deref(), Some("@mybot hello @mybotx world"));
     }
 
     // ── Transcription tests ───────────────────────────────────────
 
     #[test]
     fn mattermost_manager_none_when_transcription_not_configured() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         assert!(ch.transcription_manager.is_none());
     }
 
     #[test]
     fn mattermost_manager_some_when_valid_config() {
-        let ch = make_channel(vec!["*".into()], false).with_transcription(
-            zeroclaw_config::schema::TranscriptionConfig {
-                enabled: true,
-                default_provider: "groq".to_string(),
-                api_key: Some("test_key".to_string()),
-                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
-                model: "whisper-large-v3".to_string(),
-                language: None,
-                initial_prompt: None,
-                max_duration_secs: 600,
-                openai: None,
-                deepgram: None,
-                assemblyai: None,
-                google: None,
-                local_whisper: None,
-                transcribe_non_ptt_audio: false,
-            },
-        );
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        )
+        .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            model: "whisper-large-v3".to_string(),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 600,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: None,
+            transcribe_non_ptt_audio: false,
+        });
         assert!(ch.transcription_manager.is_some());
     }
 
     #[test]
     fn mattermost_manager_none_and_warn_on_init_failure() {
-        let ch = make_channel(vec!["*".into()], false).with_transcription(
-            zeroclaw_config::schema::TranscriptionConfig {
-                enabled: true,
-                default_provider: "groq".to_string(),
-                api_key: Some(String::new()),
-                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
-                model: "whisper-large-v3".to_string(),
-                language: None,
-                initial_prompt: None,
-                max_duration_secs: 600,
-                openai: None,
-                deepgram: None,
-                assemblyai: None,
-                google: None,
-                local_whisper: None,
-                transcribe_non_ptt_audio: false,
-            },
-        );
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        )
+        .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some(String::new()),
+            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            model: "whisper-large-v3".to_string(),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 600,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: None,
+            transcribe_non_ptt_audio: false,
+        });
         assert!(ch.transcription_manager.is_none());
     }
 
@@ -1302,7 +1728,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_uses_injected_text() {
-        let ch = make_channel(vec!["*".into()], true);
+        let thread_replies = true;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -1326,7 +1764,19 @@ mod tests {
 
     #[test]
     fn mattermost_parse_post_rejects_empty_message_without_injected() {
-        let ch = make_channel(vec!["*".into()], true);
+        let thread_replies = true;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "id": "post123",
             "user_id": "user456",
@@ -1348,7 +1798,19 @@ mod tests {
 
     #[tokio::test]
     async fn mattermost_transcribe_skips_when_manager_none() {
-        let ch = make_channel(vec!["*".into()], false);
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        );
         let post = json!({
             "metadata": {
                 "files": [
@@ -1366,24 +1828,34 @@ mod tests {
 
     #[tokio::test]
     async fn mattermost_transcribe_skips_over_duration_limit() {
-        let ch = make_channel(vec!["*".into()], false).with_transcription(
-            zeroclaw_config::schema::TranscriptionConfig {
-                enabled: true,
-                default_provider: "groq".to_string(),
-                api_key: Some("test_key".to_string()),
-                api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
-                model: "whisper-large-v3".to_string(),
-                language: None,
-                initial_prompt: None,
-                max_duration_secs: 3600,
-                openai: None,
-                deepgram: None,
-                assemblyai: None,
-                google: None,
-                local_whisper: None,
-                transcribe_non_ptt_audio: false,
-            },
-        );
+        let thread_replies = false;
+        let mention_only = false;
+        let ch = MattermostChannel::new(
+            "url".into(),
+            Some("token".into()),
+            None,
+            None,
+            Vec::new(),
+            "mattermost_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            thread_replies,
+            mention_only,
+        )
+        .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
+            enabled: true,
+            api_key: Some("test_key".to_string()),
+            api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
+            model: "whisper-large-v3".to_string(),
+            language: None,
+            initial_prompt: None,
+            max_duration_secs: 3600,
+            openai: None,
+            deepgram: None,
+            assemblyai: None,
+            google: None,
+            local_whisper: None,
+            transcribe_non_ptt_audio: false,
+        });
 
         let post = json!({
             "metadata": {
@@ -1427,17 +1899,21 @@ mod tests {
                 .await;
 
             let whisper_url = format!("{}/v1/audio/transcriptions", mock_server.uri());
+            let thread_replies = false;
+            let mention_only = false;
             let ch = MattermostChannel::new(
                 mock_server.uri(),
-                "test_token".to_string(),
+                Some("test_token".to_string()),
                 None,
-                vec!["*".into()],
-                false,
-                false,
+                None,
+                Vec::new(),
+                "mattermost_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                thread_replies,
+                mention_only,
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "local_whisper".to_string(),
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
@@ -1477,17 +1953,21 @@ mod tests {
         async fn mattermost_audio_skips_non_audio_attachment() {
             let mock_server = MockServer::start().await;
 
+            let thread_replies = false;
+            let mention_only = false;
             let ch = MattermostChannel::new(
                 mock_server.uri(),
-                "test_token".to_string(),
+                Some("test_token".to_string()),
                 None,
-                vec!["*".into()],
-                false,
-                false,
+                None,
+                Vec::new(),
+                "mattermost_test_alias",
+                Arc::new(|| vec!["*".into()]),
+                thread_replies,
+                mention_only,
             )
             .with_transcription(zeroclaw_config::schema::TranscriptionConfig {
                 enabled: true,
-                default_provider: "local_whisper".to_string(),
                 api_key: None,
                 api_url: "https://api.groq.com/openai/v1/audio/transcriptions".to_string(),
                 model: "whisper-large-v3".to_string(),
