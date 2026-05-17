@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_dashboard_spa_fallback","handle_dashboard_static","handle_spa_fallback","handle_static"]};

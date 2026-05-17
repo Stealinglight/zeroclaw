@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_api_providers_list"],"struct":["ProviderInfo","ProviderListResponse"]};

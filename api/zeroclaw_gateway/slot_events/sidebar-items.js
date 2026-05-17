@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["CHANNEL_DASHBOARD","CHANNEL_SLOTS"],"fn":["chat_channel","chat_delta","event_channel","permission_request","slot_updated","slots_full"]};

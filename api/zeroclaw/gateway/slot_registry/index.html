@@ -1,0 +1,30 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1.0"><meta name="generator" content="rustdoc"><meta name="description" content="Warm-agent registry keyed on slot id (M2.5)."><title>zeroclaw::gateway::slot_registry - Rust</title><script>if(window.location.protocol!=="file:")document.head.insertAdjacentHTML("beforeend","SourceSerif4-Regular-6b053e98.ttf.woff2,FiraSans-Italic-81dc35de.woff2,FiraSans-Regular-0fe48ade.woff2,FiraSans-MediumItalic-ccf7e434.woff2,FiraSans-Medium-e1aa3f0a.woff2,SourceCodePro-Regular-8badfe75.ttf.woff2,SourceCodePro-Semibold-aa29a496.ttf.woff2".split(",").map(f=>`<link rel="preload" as="font" type="font/woff2"href="../../../static.files/${f}">`).join(""))</script><link rel="stylesheet" href="../../../static.files/normalize-9960930a.css"><link rel="stylesheet" href="../../../static.files/rustdoc-b7b9f40b.css"><script id="default-settings" 
+data-use_system_theme="false"
+data-theme="ayu"></script><meta name="rustdoc-vars" data-root-path="../../../" data-static-root-path="../../../static.files/" data-current-crate="zeroclaw" data-themes="" data-resource-suffix="" data-rustdoc-version="1.95.0 (59807616e 2026-04-14)" data-channel="1.95.0" data-search-js="search-63369b7b.js" data-stringdex-js="stringdex-b897f86f.js" data-settings-js="settings-170eb4bf.js" ><script src="../../../static.files/storage-41dd4d93.js"></script><script defer src="../sidebar-items.js"></script><script defer src="../../../static.files/main-5013f961.js"></script><noscript><link rel="stylesheet" href="../../../static.files/noscript-f7c3ffd8.css"></noscript><link rel="alternate icon" type="image/png" href="../../../static.files/favicon-32x32-eab170b8.png"><link rel="icon" type="image/svg+xml" href="../../../static.files/favicon-044be391.svg"></head><body class="rustdoc mod"><a class="skip-main-content" href="#main-content">Skip to main content</a><!--[if lte IE 11]><div class="warning">This old browser is unsupported and will most likely display funky things.</div><![endif]--><rustdoc-topbar><h2><a href="#">Module slot_registry</a></h2></rustdoc-topbar><nav class="sidebar"><div class="sidebar-crate"><h2><a href="../../../zeroclaw/index.html">zeroclaw</a><span class="version">0.7.5</span></h2></div><div class="sidebar-elems"><section id="rustdoc-toc"><h2 class="location"><a href="#">Module slot_<wbr>registry</a></h2><h3><a href="#structs">Module Items</a></h3><ul class="block"><li><a href="#structs" title="Structs">Structs</a></li></ul></section><div id="rustdoc-modnav"><h2><a href="../index.html">In zeroclaw::<wbr>gateway</a></h2></div></div></nav><div class="sidebar-resizer" title="Drag to resize sidebar"></div><main><div class="width-limiter"><section id="main-content" class="content" tabindex="-1"><div class="main-heading"><div class="rustdoc-breadcrumbs"><a href="../../index.html">zeroclaw</a>::<wbr><a href="../index.html">gateway</a></div><h1>Module <span>slot_<wbr>registry</span>&nbsp;<button id="copy-path" title="Copy item path to clipboard">Copy item path</button></h1><rustdoc-toolbar></rustdoc-toolbar><span class="sub-heading"><a class="src" href="../../../src/zeroclaw_gateway/lib.rs.html#34">Source</a> </span></div><details class="toggle top-doc" open><summary class="hideme"><span>Expand description</span></summary><div class="docblock"><p>Warm-agent registry keyed on slot id (M2.5).</p>
+<p>Each slot owns a long-lived <code>Arc&lt;Mutex&lt;Agent&gt;&gt;</code> so a sequence of
+turns against the same slot reuses one Agent — skipping the
+expensive <code>Agent::from_config</code> init each time (see
+<code>multi-session-dashboard.md §4.5</code>). The shared <code>Arc&lt;McpRegistry&gt;</code>
+that all warm agents reference keeps the process’s MCP subprocess
+count constant at N (configured servers), not N × slot_count.</p>
+<p>Scope for this M2.5 slice:</p>
+<ul>
+<li><code>get_or_spawn(slot_id, overrides, base_config, shared_mcp)</code> —
+returns a cloned <code>Arc&lt;SlotEntry&gt;</code>; constructs on miss, reuses on
+hit.</li>
+<li><code>get(slot_id)</code> — non-destructive lookup (used by REST
+<code>/approve</code> to access the slot’s pending-approval map).</li>
+<li><code>remove(slot_id)</code> — forced eviction from <code>DELETE /api/slots/{id}</code>.</li>
+<li><code>evict_idle()</code> — background sweep drops entries past <code>idle_ttl</code>.</li>
+<li><code>pending_approvals</code> per slot: the slot-scoped map that the
+per-turn <code>WsApprovalChannel</code> + REST <code>/approve</code> share.</li>
+</ul>
+<p>Pressure-eviction (LRU of idle entries when the store hits its hard
+limit) is a plan §4.5 concern but deferred here: the M1 store-level
+hard limit on create already prevents unbounded slot counts, so
+warm-agent pressure-eviction is a subsidiary safety net that lands
+with real load-testing work.</p>
+</div></details><h2 id="structs" class="section-header">Structs<a href="#structs" class="anchor">§</a></h2><dl class="item-table"><dt><a class="struct" href="struct.SlotEntry.html" title="struct zeroclaw::gateway::slot_registry::SlotEntry">Slot<wbr>Entry</a></dt><dd>A warm entry in the registry. <code>agent</code> is <code>Arc&lt;tokio::sync::Mutex&lt;_&gt;&gt;</code>
+so callers hold it across <code>.await</code> points on the single turn they’re
+serving without blocking the registry itself.</dd><dt><a class="struct" href="struct.SlotRegistry.html" title="struct zeroclaw::gateway::slot_registry::SlotRegistry">Slot<wbr>Registry</a></dt><dd>Process-global registry of warm slot agents. Stored on
+<code>AppState::slot_registry</code>; cheap to clone (inner is one <code>Arc</code>).</dd></dl></section></div></main></body></html>

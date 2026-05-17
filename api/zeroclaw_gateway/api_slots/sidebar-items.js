@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["handle_api_slots_approve","handle_api_slots_create","handle_api_slots_delete","handle_api_slots_duplicate","handle_api_slots_get","handle_api_slots_list","handle_api_slots_messages","handle_api_slots_patch","handle_api_slots_stop"],"struct":["SlotApproveRequest","SlotMessageRequest"]};

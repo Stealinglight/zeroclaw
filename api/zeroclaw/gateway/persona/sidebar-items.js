@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"fn":["default_presets","delete_one","load_all","load_one","persona_path","personas_dir","save_one","seed_defaults_if_empty","validate_name"],"struct":["PersonaError","PersonaListResponse","PersonaPreset"]};

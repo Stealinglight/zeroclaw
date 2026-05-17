@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ActorQueueError"],"struct":["ActorQueue","QueueGuard"],"type":["SessionActorQueue","SessionGuard","SessionQueueError","SlotActorQueue","SlotGuard","SlotQueueError"]};

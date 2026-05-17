@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["MAX_BUDGET_TOKENS"],"enum":["ThinkingLevel","VoiceProvider"],"struct":["AutoClassifyConfig","BrowserDelegateConfig","ClawdTalkConfig","ContextCompressionConfig","EmailConfig","EvalConfig","GmailPushConfig","HistoryPrunerConfig","NativeThinkingParams","ThinkingConfig","TrustConfig","VoiceCallConfig"]};

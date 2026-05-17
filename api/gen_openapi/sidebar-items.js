@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"constant":["SNAPSHOT_REL_PATH"],"fn":["check_against_snapshot","main","print_unified_diff","render_spec","write_snapshot"],"struct":["Cli"]};

@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"mod":["agent","channel","media","memory_traits","observability_traits","peripherals_traits","provider","runtime_traits","schema","tool","vad"],"static":["NATIVE_THINKING_OVERRIDE","TOOL_CHOICE_OVERRIDE","TOOL_LOOP_SESSION_KEY","TOOL_LOOP_THREAD_ID"]};

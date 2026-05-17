@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["SlotMode","SlotState"],"struct":["Slot","SlotAgentConfig","SlotUpdate"],"trait":["SlotStore"]};
