@@ -31,6 +31,7 @@ import {
 import { useControlUiBootstrap } from "@/app/ControlUiBootstrapProvider";
 import { SectionNav } from "@/app/SectionNav";
 import { ThemeSwitcher } from "@/theme/ThemeSwitcher";
+import { formatRelativeTime } from "@/lib/formatRelativeTime";
 import {
   pickMostRecentMemory,
   pickNextCronRun,
@@ -167,7 +168,7 @@ function MemoryCard() {
     <CardShell
       title="Memory"
       icon={Brain}
-      href="/overview"
+      href="/memory"
       isLoading={isLoading}
       error={error}
     >
@@ -186,7 +187,7 @@ function MemoryCard() {
           style={{ color: "var(--color-text-muted)" }}
           title={recent.content}
         >
-          Latest: {formatRelative(recent.timestamp)} —{" "}
+          Latest: {formatRelativeTime(recent.timestamp)} —{" "}
           <span style={{ color: "var(--color-text)" }}>{recent.key}</span>
         </p>
       ) : null}
@@ -231,7 +232,7 @@ function CronsCard() {
           <span style={{ color: "var(--color-text)" }}>
             {next.name ?? next.id}
           </span>{" "}
-          in {formatRelative(next.next_run)}
+          in {formatRelativeTime(next.next_run)}
         </p>
       ) : (
         <p
@@ -309,23 +310,6 @@ function SkillsCard() {
 }
 
 // ── Formatting helpers ─────────────────────────────────────────────
-
-/**
- * Renders a difference like "in 5m", "3h ago" without pulling in a
- * date library. Browser-native `Intl.RelativeTimeFormat` is ES2020
- * and is in every browser TS targets.
- */
-function formatRelative(iso: string): string {
-  const ts = Date.parse(iso);
-  if (Number.isNaN(ts)) return iso;
-  const diffSec = Math.round((ts - Date.now()) / 1000);
-  const fmt = new Intl.RelativeTimeFormat(undefined, { numeric: "auto" });
-  const abs = Math.abs(diffSec);
-  if (abs < 60) return fmt.format(diffSec, "second");
-  if (abs < 3600) return fmt.format(Math.round(diffSec / 60), "minute");
-  if (abs < 86400) return fmt.format(Math.round(diffSec / 3600), "hour");
-  return fmt.format(Math.round(diffSec / 86400), "day");
-}
 
 /**
  * Maps Rust IntegrationCategory variant names (the wire format produced

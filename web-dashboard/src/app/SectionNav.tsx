@@ -30,6 +30,7 @@ const ITEMS: NavItem[] = [
   { to: "/board", label: "Board", prefix: "/board" },
   { to: "/overview", label: "Overview", prefix: "/overview" },
   { to: "/system", label: "System", prefix: "/system" },
+  { to: "/memory", label: "Memory", prefix: "/memory" },
 ];
 
 interface SectionNavProps {
