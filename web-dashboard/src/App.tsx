@@ -4,6 +4,7 @@ import { ChatPage } from "@/chat/ChatPage";
 import { BoardPage } from "@/board/BoardPage";
 import { OverviewPage } from "@/overview/OverviewPage";
 import { SystemPage } from "@/system/SystemPage";
+import { MemoryPage } from "@/memory/MemoryPage";
 import { ToastHost, ToastProvider } from "@/lib/toasts";
 
 // Routes:
@@ -13,6 +14,7 @@ import { ToastHost, ToastProvider } from "@/lib/toasts";
 //   /board         → BoardPage 4-lane Kanban
 //   /overview      → OverviewPage memory/cron/integrations/tools cards
 //   /system        → SystemPage live status, component health, cost
+//   /memory        → MemoryPage browse/search/delete memory entries
 export default function App() {
   return (
     <ControlUiBootstrapProvider>
@@ -24,6 +26,7 @@ export default function App() {
           <Route path="/board" element={<BoardPage />} />
           <Route path="/overview" element={<OverviewPage />} />
           <Route path="/system" element={<SystemPage />} />
+          <Route path="/memory" element={<MemoryPage />} />
         </Routes>
         <ToastHost />
       </ToastProvider>
