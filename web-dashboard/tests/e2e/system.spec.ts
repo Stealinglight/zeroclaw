@@ -65,8 +65,16 @@ const COST_BODY = {
     total_tokens: 123456,
     request_count: 42,
     by_model: {
-      "claude-sonnet-4-6": 10.0,
-      "claude-haiku-4-5": 2.3456,
+      "claude-sonnet-4-6": {
+        cost_usd: 10.0,
+        total_tokens: 100000,
+        request_count: 30,
+      },
+      "claude-haiku-4-5": {
+        cost_usd: 2.3456,
+        total_tokens: 23456,
+        request_count: 12,
+      },
     },
   },
 };
