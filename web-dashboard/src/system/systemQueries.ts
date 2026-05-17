@@ -64,13 +64,20 @@ export function useStatusQuery() {
 
 // ── Cost ───────────────────────────────────────────────────────────
 
+export interface ModelStats {
+  model: string;
+  cost_usd: number;
+  total_tokens: number;
+  request_count: number;
+}
+
 export interface CostSummary {
   session_cost_usd: number;
   daily_cost_usd: number;
   monthly_cost_usd: number;
   total_tokens: number;
   request_count: number;
-  by_model: Record<string, number>;
+  by_model: Record<string, ModelStats>;
 }
 
 export interface CostResponse {
