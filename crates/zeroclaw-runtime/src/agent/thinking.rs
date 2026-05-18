@@ -127,10 +127,15 @@ pub fn apply_thinking_level_with_config(
     {
         let clamped = budget.min(MAX_BUDGET_TOKENS);
         if clamped < budget {
-            tracing::warn!(
-                requested = budget,
-                clamped = clamped,
-                max = MAX_BUDGET_TOKENS,
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "requested": budget,
+                        "clamped": clamped,
+                        "max": MAX_BUDGET_TOKENS,
+                    })),
                 "budget_tokens exceeds maximum; clamping to configured limit"
             );
         }
@@ -180,7 +185,12 @@ pub fn resolve_thinking_from_message(
 ) -> ResolvedThinking {
     let (directive, effective_message) = match parse_thinking_directive(message) {
         Some((level, remaining)) => {
-            tracing::info!(thinking_level = ?level, "Thinking directive parsed from message");
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"thinking_level": format!("{level:?}")})),
+                "Thinking directive parsed from message"
+            );
             (Some(level), remaining)
         }
         None => (None, message.to_string()),

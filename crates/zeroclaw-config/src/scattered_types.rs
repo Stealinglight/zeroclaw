@@ -61,7 +61,7 @@ impl ThinkingLevel {
     }
 }
 
-pub use zeroclaw_api::provider::{MAX_BUDGET_TOKENS, NativeThinkingParams};
+pub use zeroclaw_api::model_provider::{MAX_BUDGET_TOKENS, NativeThinkingParams};
 
 /// Configuration for thinking/reasoning level control.
 #[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
@@ -106,8 +106,11 @@ impl ThinkingConfig {
         const ALL_LEVELS: &[ThinkingLevel] = &[Off, Minimal, Low, Medium, High, Max];
         for key in self.budget_tokens.keys() {
             if !ALL_LEVELS.iter().any(|l| l.as_str() == key) {
-                tracing::warn!(
-                    key = %key,
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"key": key})),
                     "Unknown thinking level in budget_tokens config; \
                      valid levels are: off, minimal, low, medium, high, max"
                 );

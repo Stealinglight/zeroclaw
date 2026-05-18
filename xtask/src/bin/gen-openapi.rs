@@ -158,10 +158,4 @@ mod tests {
         assert!(s.ends_with('\n'), "snapshot must end with newline");
     }
 
-    #[test]
-    fn render_contains_slot_paths() {
-        let s = render_spec().unwrap();
-        assert!(s.contains("/api/slots"));
-        assert!(s.contains("SlotResponse"));
-    }
 }

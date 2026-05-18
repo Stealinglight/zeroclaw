@@ -1593,6 +1593,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1629,6 +1630,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1661,6 +1663,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,
@@ -1693,6 +1696,7 @@ mod tests {
                 ProviderChatRequest {
                     messages: &messages,
                     tools: None,
+                    thinking: None,
                 },
                 "gpt-5-codex",
                 None,

@@ -590,6 +590,7 @@ async fn consume_provider_streaming_response(
         ChatRequest {
             messages,
             tools: request_tools,
+            thinking: None,
         },
         model,
         temperature,
@@ -1185,6 +1186,7 @@ pub async fn run_tool_call_loop(
                                 ChatRequest {
                                     messages: &prepared_messages.messages,
                                     tools: request_tools,
+                                    thinking: None,
                                 },
                                 active_model,
                                 temperature,
@@ -1214,6 +1216,7 @@ pub async fn run_tool_call_loop(
                     ChatRequest {
                         messages: &prepared_messages.messages,
                         tools: request_tools,
+                        thinking: None,
                     },
                     active_model,
                     temperature,
@@ -2155,6 +2158,7 @@ pub async fn run_tool_call_loop(
     let summary_request = zeroclaw_providers::ChatRequest {
         messages: history,
         tools: None, // No tools — force a text response
+        thinking: None,
     };
     match model_provider
         .chat(summary_request, model, temperature)
@@ -4626,6 +4630,7 @@ mod tests {
                 native_tool_calling: false,
                 vision: true,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -4928,6 +4933,7 @@ mod tests {
                 native_tool_calling: true,
                 vision: false,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 

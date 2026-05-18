@@ -43,5 +43,5 @@ tokio::task_local! {
 
     /// Native extended thinking parameters, set by the outer orchestration
     /// functions and read by `run_tool_call_loop` when building `ChatRequest`.
-    pub static NATIVE_THINKING_OVERRIDE: Option<crate::provider::NativeThinkingParams>;
+    pub static NATIVE_THINKING_OVERRIDE: Option<crate::model_provider::NativeThinkingParams>;
 }

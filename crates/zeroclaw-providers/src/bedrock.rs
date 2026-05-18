@@ -1475,26 +1475,29 @@ impl ModelProvider for BedrockModelProvider {
         let tool_config = Self::convert_tools_to_converse(request.tools);
 
         // Extended thinking support
-        let (effective_temperature, additional_fields, effective_max_tokens) =
-            match request.thinking {
-                Some(params) => {
-                    tracing::info!(
-                        budget_tokens = params.budget_tokens,
-                        "Bedrock native extended thinking enabled; forcing temperature=1.0"
-                    );
-                    let fields = serde_json::json!({
-                        "thinking": {
-                            "type": "enabled",
-                            "budget_tokens": params.budget_tokens
-                        }
-                    });
-                    // Bedrock requires max_tokens > budget_tokens (strictly greater).
-                    let min_required = params.budget_tokens + 1;
-                    let max_tokens = self.max_tokens.max(min_required);
-                    (1.0, Some(fields), max_tokens)
-                }
-                None => (temperature, None, self.max_tokens),
-            };
+        let (effective_temperature, additional_fields, effective_max_tokens) = match request
+            .thinking
+        {
+            Some(params) => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"budget_tokens": params.budget_tokens})),
+                    "Bedrock native extended thinking enabled; forcing temperature=1.0"
+                );
+                let fields = serde_json::json!({
+                    "thinking": {
+                        "type": "enabled",
+                        "budget_tokens": params.budget_tokens
+                    }
+                });
+                // Bedrock requires max_tokens > budget_tokens (strictly greater).
+                let min_required = params.budget_tokens + 1;
+                let max_tokens = self.max_tokens.max(min_required);
+                (1.0, Some(fields), max_tokens)
+            }
+            None => (temperature, None, self.max_tokens),
+        };
 
         // When native thinking is active, Anthropic requires temperature=1.0 and
         // we must send it explicitly even on models that would otherwise omit it.

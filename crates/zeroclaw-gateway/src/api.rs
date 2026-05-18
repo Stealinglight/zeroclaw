@@ -1778,16 +1778,10 @@ mod tests {
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
             session_queue: Arc::new(crate::session_queue::SessionActorQueue::new(8, 30, 600)),
-            slot_queue: Arc::new(crate::session_queue::SlotActorQueue::new(8, 30, 600)),
-            slot_store: None,
-            slot_cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            mcp_registry: None,
-            slot_registry: crate::slot_registry::SlotRegistry::new(600),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
             web_dist_dir: None,
-            web_dashboard_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             pending_reload: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -2220,11 +2214,11 @@ mod tests {
     async fn control_ui_config_returns_expected_shape() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(&config.data_dir).unwrap();
         let state = test_state(config);
 
         let response = handle_api_control_ui_config(State(state), HeaderMap::new())
@@ -2258,11 +2252,11 @@ mod tests {
         // snapshot to an unpaired caller.
         let tmp = tempfile::TempDir::new().unwrap();
         let config = zeroclaw_config::schema::Config {
-            workspace_dir: tmp.path().join("workspace"),
+            data_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..zeroclaw_config::schema::Config::default()
         };
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        std::fs::create_dir_all(&config.data_dir).unwrap();
         let mut state = test_state(config);
         // Swap in a pairing guard that requires pairing and has no
         // trusted tokens. With no `Authorization` header on the
