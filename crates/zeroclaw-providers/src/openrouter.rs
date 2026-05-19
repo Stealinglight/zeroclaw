@@ -467,6 +467,7 @@ impl ModelProvider for OpenRouterModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: false,
+            extended_thinking: false,
         }
     }
 
@@ -972,6 +973,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
         let mut stream = model_provider.stream_chat(
@@ -1010,6 +1012,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking: None,
         };
 
         let mut stream = model_provider.stream_chat(

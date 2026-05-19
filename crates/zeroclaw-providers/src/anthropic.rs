@@ -984,6 +984,7 @@ impl ModelProvider for AnthropicModelProvider {
             native_tool_calling: true,
             vision: true,
             prompt_caching: true,
+            extended_thinking: true,
         }
     }
 
@@ -1044,6 +1045,7 @@ impl ModelProvider for AnthropicModelProvider {
             } else {
                 Some(&tool_specs)
             },
+            thinking: None,
         };
         self.chat(request, model, temperature).await
     }
