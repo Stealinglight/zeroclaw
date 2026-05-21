@@ -679,8 +679,10 @@ pub async fn run_gateway(
     //
     // `mcp_registry_handle` exposes the live registry on AppState for handlers
     // (e.g. `/api/integrations`, future probe/sync) without traversing the
-    // tool registry. `None` covers two cases: MCP disabled in config, or every
-    // server's `connect_all` failed (graceful-degradation contract).
+    // tool registry. `None` means MCP is disabled or no MCP servers are
+    // configured. Because `tools::McpRegistry::connect_all` is intentionally
+    // non-fatal and skips failed connections, `Some(...)` may still contain an
+    // empty registry when all configured servers fail to connect.
     let mut mcp_registry_handle: Option<Arc<tools::McpRegistry>> = None;
     if config.mcp.enabled && !config.mcp.servers.is_empty() {
         ::zeroclaw_log::record!(
