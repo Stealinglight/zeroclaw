@@ -157,5 +157,4 @@ mod tests {
         let s = render_spec().unwrap();
         assert!(s.ends_with('\n'), "snapshot must end with newline");
     }
-
 }
