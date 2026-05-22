@@ -23,6 +23,8 @@ import {
   MemoryStick,
   Brain,
   Search,
+  Puzzle,
+  Sparkles,
 } from 'lucide-react';
 import type {
   StatusResponse,
@@ -43,6 +45,9 @@ import {
   storeMemory,
   deleteMemory,
   getMapKeys,
+  getCronJobs,
+  getIntegrations,
+  listSkillBundles,
 } from '@/lib/api';
 import { resolveModelToProviderType } from '@/lib/configuredModels';
 
@@ -298,16 +303,45 @@ const TABS: { id: TabId; labelKey: string; icon: typeof LayoutDashboard }[] = [
 // Overview Tab (existing dashboard content)
 // ---------------------------------------------------------------------------
 
+// `null` means the count is unknown (initial load not finished, or the most
+// recent fetch failed); render as "—" rather than "0" so users do not mistake
+// a transient fetch error for an empty resource.
+type OverviewAggregations = {
+  memory: number | null;
+  crons: number | null;
+  mcp: number | null;
+  skills: number | null;
+};
+
+function formatTileCount(n: number | null): string {
+  return n == null ? '—' : n.toLocaleString();
+}
+
+const AGGREGATION_TILES: {
+  key: keyof OverviewAggregations;
+  to: string;
+  icon: typeof Brain;
+  accent: string;
+  labelKey: string;
+}[] = [
+  { key: 'memory', to: '/?tab=memories', icon: Brain, accent: '#a78bfa', labelKey: 'dashboard.tile_memory' },
+  { key: 'crons', to: '/cron', icon: Clock, accent: '#34d399', labelKey: 'dashboard.tile_crons' },
+  { key: 'mcp', to: '/integrations', icon: Puzzle, accent: '#60a5fa', labelKey: 'dashboard.tile_mcp' },
+  { key: 'skills', to: '/config/skill-bundles', icon: Sparkles, accent: '#f472b6', labelKey: 'dashboard.tile_skills' },
+];
+
 function OverviewTab({
   status,
   cost,
   showAllChannels,
   setShowAllChannels,
+  aggregations,
 }: {
   status: StatusResponse;
   cost: CostSummary;
   showAllChannels: boolean;
   setShowAllChannels: (fn: (v: boolean) => boolean) => void;
+  aggregations: OverviewAggregations;
 }) {
   const maxCost = Math.max(
     cost.session_cost_usd,
@@ -591,6 +625,51 @@ function OverviewTab({
               </div>
             );
           })()}
+        </div>
+      </div>
+
+      {/* Aggregation tiles — at-a-glance counts that link to dedicated views */}
+      <div>
+        <h2
+          className="text-sm font-semibold uppercase tracking-wider mb-3"
+          style={{ color: 'var(--pc-text-primary)' }}
+        >
+          {t('dashboard.aggregations_heading')}
+        </h2>
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 stagger-children">
+          {AGGREGATION_TILES.map(({ key, to, icon: Icon, accent, labelKey }) => (
+            <Link
+              key={key}
+              to={to}
+              className="card p-5 animate-slide-in-up flex flex-col gap-2 transition-all hover:opacity-90"
+              style={{ textDecoration: 'none' }}
+            >
+              <div className="flex items-center gap-3">
+                <div
+                  className="p-2 rounded-2xl"
+                  style={{ background: 'rgba(var(--pc-accent-rgb), 0.08)', color: accent }}
+                >
+                  <Icon className="h-5 w-5" />
+                </div>
+                <span
+                  className="text-xs uppercase tracking-wider font-medium"
+                  style={{ color: 'var(--pc-text-muted)' }}
+                >
+                  {t(labelKey)}
+                </span>
+                <ChevronRight
+                  className="h-4 w-4 ml-auto"
+                  style={{ color: 'var(--pc-text-faint)' }}
+                />
+              </div>
+              <p
+                className="text-2xl font-semibold tabular-nums"
+                style={{ color: 'var(--pc-text-primary)' }}
+              >
+                {formatTileCount(aggregations[key])}
+              </p>
+            </Link>
+          ))}
         </div>
       </div>
     </>
@@ -1310,6 +1389,12 @@ export default function Dashboard() {
   const [costWindow, setCostWindow] = useState<CostWindow>('today');
   const [error, setError] = useState<string | null>(null);
   const [showAllChannels, setShowAllChannels] = useState(false);
+  const [aggregations, setAggregations] = useState<OverviewAggregations>({
+    memory: null,
+    crons: null,
+    mcp: null,
+    skills: null,
+  });
   const [searchParams, setSearchParams] = useSearchParams();
   const activeTab = parseTab(searchParams.get('tab'));
   const setActiveTab = (id: TabId) => {
@@ -1348,6 +1433,24 @@ export default function Dashboard() {
         .catch((err) => {
           if (!cancelled) setError(err.message);
         });
+      // allSettled so one failing endpoint does not blank all four tiles —
+      // a rejected fetch keeps that tile at its previous count (or null on
+      // first load) while the others still update.
+      Promise.allSettled([
+        getMemory(),
+        getCronJobs(),
+        getIntegrations(),
+        listSkillBundles(),
+      ]).then(([memRes, cronRes, mcpRes, skillsRes]) => {
+        if (cancelled) return;
+        setAggregations((prev) => ({
+          memory: memRes.status === 'fulfilled' ? memRes.value.length : prev.memory,
+          crons: cronRes.status === 'fulfilled' ? cronRes.value.length : prev.crons,
+          mcp: mcpRes.status === 'fulfilled' ? mcpRes.value.length : prev.mcp,
+          skills:
+            skillsRes.status === 'fulfilled' ? skillsRes.value.bundles.length : prev.skills,
+        }));
+      });
     };
     refresh();
     // Uptime ticks every second on the server; poll every 5s so the tile and
@@ -1427,6 +1530,7 @@ export default function Dashboard() {
           cost={cost}
           showAllChannels={showAllChannels}
           setShowAllChannels={setShowAllChannels}
+          aggregations={aggregations}
         />
       )}
       {activeTab === 'sessions' && <SessionsTab />}
